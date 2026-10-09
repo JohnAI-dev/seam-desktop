@@ -155,7 +155,12 @@ pub fn start(app: &AppHandle, system_notifications: bool) -> Link {
     tauri::async_runtime::spawn(async move {
         match LinkServer::bind(PORTS).await {
             Ok(listener) => {
-                state.lock().unwrap().port = listener.local_addr().map(|a| a.port()).ok();
+                let port = listener.local_addr().map(|a| a.port()).ok();
+                state.lock().unwrap().port = port;
+                // Best-effort: a failure must not stop the link (the QR code still works).
+                if let Some(port) = port {
+                    advertise_on_network(srv.desktop_name(), srv.fingerprint(), port);
+                }
                 srv.serve(listener).await;
             }
             Err(e) => {
@@ -176,6 +181,36 @@ pub fn start(app: &AppHandle, system_notifications: bool) -> Link {
     Link {
         server: Some(server),
         shared,
+    }
+}
+
+/// Publish the link on the local network so phones can find this computer after
+/// its address changes. Runs on its own thread; errors are only logged.
+fn advertise_on_network(name: &str, fingerprint: &str, port: u16) {
+    let name = name.to_string();
+    let fingerprint = fingerprint.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("seam-mdns".to_string())
+        .spawn(move || {
+            let desc = link::mdns::service_description(&name, port, &fingerprint);
+            match link::mdns::advertise(&desc) {
+                Ok(_advertiser) => {
+                    eprintln!(
+                        "Seam link: advertising {} on the local network (port {port})",
+                        desc.instance_name
+                    );
+                    // Dropping the advertiser would stop the announcement.
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Seam link: could not advertise on the local network: {e}");
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("Seam link: could not advertise on the local network: {e}");
     }
 }
 

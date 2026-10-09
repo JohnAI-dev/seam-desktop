@@ -1,7 +1,9 @@
 //! The secure phone link: lets the Seam phone app talk to this computer over Wi-Fi,
-//! without USB debugging. Protocol: `protocol/PROTOCOL.md`.
+//! without USB debugging, and advertises the computer on the local network so a
+//! paired phone can find it after an IP change. Protocol: `protocol/PROTOCOL.md`.
 
 pub mod client;
+pub mod mdns;
 pub mod protocol;
 pub mod server;
 pub mod store;
