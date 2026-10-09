@@ -243,6 +243,16 @@ def main():
 
     sh("git", "-c", "user.name=grok-agent", "-c", "user.email=grok-agent@users.noreply.github.com",
        "commit", "-q", "-m", f"Fix #{num}: {title}\n\n{summary}")
+    # main may have moved while we worked (other merges, pipeline updates). Put this
+    # change on top of the latest main so the PR contains only our change; CI re-tests it.
+    sh("git", "fetch", "-q", "origin", "main")
+    rebase = sh("git", "rebase", "origin/main", check=False)
+    if rebase.returncode != 0:
+        sh("git", "rebase", "--abort", check=False)
+        gh_api("POST", f"repos/{REPO}/issues/{num}/comments", {"body":
+               "🤖 The change conflicts with newer changes on main. Re-run the agent "
+               "(remove and re-add the `agent` label) to redo it on top of the latest code."})
+        sys.exit(1)
     sh("git", "push", "-f", "origin", branch)
     owner = REPO.split("/")[0]
     existing = gh_api("GET", f"repos/{REPO}/pulls?state=open&head={owner}:{branch}")
