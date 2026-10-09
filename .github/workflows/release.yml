@@ -57,11 +57,17 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Fetch built-in adb and scrcpy
         run: python scripts/fetch_tools.py ${{ matrix.tools }}
+      - name: Sign built-in tools (Mac)
+        if: runner.os == 'macOS'
+        run: |
+          for t in adb scrcpy; do
+            codesign --force --sign - --timestamp=none src-tauri/resources/tools/$t
+          done
       - name: Build installers
         shell: bash
         env:
@@ -72,7 +78,12 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           app=$(find target/release/bundle/macos -maxdepth 1 -name '*.app' | head -1)
-          codesign --verify --deep --strict --verbose=2 "$app"
+          [ -n "$app" ] || { echo "::error::no .app found in target/release/bundle/macos"; exit 1; }
+          if ! out=$(codesign --verify --deep --strict --verbose=2 "$app" 2>&1); then
+            echo "$out"
+            echo "::error title=Mac signature invalid::$(echo "$out" | tail -3 | tr '\n' ' ')"
+            exit 1
+          fi
           codesign -dv "$app" 2>&1 | grep -E "Signature|Identifier|Format"
           for t in adb scrcpy; do
             f="$app/Contents/Resources/tools/$t"
