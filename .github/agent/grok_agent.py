@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import traceback
 import sys
 import urllib.error
@@ -60,8 +61,21 @@ def grok(system, user):
         API_URL, data=json.dumps(body).encode(), method="POST",
         headers={"Authorization": f"Bearer {os.environ['XAI_API_KEY']}",
                  "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=600) as r:
-        text = json.loads(r.read())["choices"][0]["message"]["content"]
+    text = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=1500) as r:
+                text = json.loads(r.read())["choices"][0]["message"]["content"]
+            break
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                raise
+            print(f"Grok API returned {e.code}; retrying", flush=True)
+        except (TimeoutError, OSError) as e:
+            if attempt == 2:
+                raise
+            print(f"Grok API call failed ({e}); retrying", flush=True)
+        time.sleep(15 * (attempt + 1))
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
     return json.loads(text)
 
@@ -105,6 +119,18 @@ def apply_changes(changes):
         if c.get("action") == "delete":
             if p.exists():
                 p.unlink()
+        elif c.get("action") == "edit":
+            if not p.exists():
+                raise ValueError(f"edit: {path} does not exist (use action write to create it)")
+            content = p.read_text(encoding="utf-8")
+            for e in c.get("edits", []):
+                old, new = e.get("old", ""), e.get("new", "")
+                count = content.count(old) if old else 0
+                if count != 1:
+                    raise ValueError(f"edit in {path}: the 'old' text must appear exactly once, "
+                                     f"found {count} times. Old text was:\n{old[:500]}")
+                content = content.replace(old, new)
+            p.write_text(content, encoding="utf-8")
         else:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(c["content"], encoding="utf-8")
@@ -120,9 +146,15 @@ and launching the real app headless with --self-test); your change must make it 
 Add unit tests for new logic. Code is auto-formatted with rustfmt before testing.
 Respond with ONLY a JSON object:
 {{"summary": "one paragraph for the PR description",
-  "changes": [{{"path": "relative/path", "action": "write", "content": "full new file content"}},
-              {{"path": "relative/path", "action": "delete"}}]}}
-Always give the FULL content of every file you write."""
+  "changes": [
+    {{"path": "existing/file", "action": "edit",
+      "edits": [{{"old": "exact text copied from the file", "new": "replacement text"}}]}},
+    {{"path": "new/file", "action": "write", "content": "full content of a new file"}},
+    {{"path": "unwanted/file", "action": "delete"}}]}}
+Prefer "edit" for existing files: each "old" must be copied exactly from the current file
+(including indentation) and appear exactly once; include a few surrounding lines to make
+it unique. Edits in one file are applied in order. Use "write" only for new files or when
+rewriting most of a small file."""
 
 REVIEWER = """You are a strict code reviewer. You did not write this change.
 Approve only if the diff fully resolves the issue, introduces no bugs, no security problems,
