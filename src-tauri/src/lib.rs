@@ -42,7 +42,15 @@ fn status() -> Status {
     let (scrcpy_status, _) = tool_status(Tool::Scrcpy);
     let (devices, error) = match adb_path {
         Some(p) => match adb::list_devices(&p) {
-            Ok(d) => (d, None),
+            Ok(mut devices) => {
+                for device in &mut devices {
+                    if device.is_ready() {
+                        // A battery read failure must not hide the phone.
+                        device.battery = adb::read_battery(&p, &device.serial).ok();
+                    }
+                }
+                (devices, None)
+            }
             Err(e) => (Vec::new(), Some(e)),
         },
         None => (Vec::new(), None),
