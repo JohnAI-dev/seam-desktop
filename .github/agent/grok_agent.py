@@ -152,12 +152,13 @@ def main():
             summary = plan.get("summary", "")
             touched = apply_changes(plan.get("changes", []))
         except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
+            body = e.read().decode(errors="replace")[:500]
+            if e.code in (401, 403) or (e.code == 400 and "api key" in body.lower()):
                 gh_api("POST", f"repos/{REPO}/issues/{num}/comments", {"body":
-                       f"🤖 xAI rejected the API key (HTTP {e.code}). Check the `XAI_API_KEY` secret in "
+                       f"🤖 xAI rejected the API key (HTTP {e.code}: {body}). Check the `XAI_API_KEY` secret in "
                        "Settings → Secrets and variables → Actions, then re-run the Grok agent workflow."})
                 sys.exit(1)
-            feedback = f"Grok API error: {e} {e.read().decode(errors='replace')[:500]}"
+            feedback = f"Grok API error: {e} {body}"
             print(feedback, flush=True)
             continue
         except Exception as e:
