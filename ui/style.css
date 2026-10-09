@@ -61,3 +61,10 @@ button.link { background: transparent; color: var(--muted); padding: 4px 8px; fo
   flex: none; background: transparent; color: var(--muted);
   padding: 0 2px; font-size: 18px; line-height: 1; font-weight: 400;
 }
+
+.update {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  margin: 0 0 16px; padding: 10px 14px; border-radius: 10px;
+  background: var(--card); border: 1px solid var(--accent);
+}
+.version { color: var(--muted); font-size: 12px; margin-top: 28px; text-align: center; }

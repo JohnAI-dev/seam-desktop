@@ -44,5 +44,16 @@
       "signingIdentity": "-",
       "minimumSystemVersion": "11.0"
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/JohnAI-dev/seam-desktop/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

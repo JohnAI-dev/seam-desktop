@@ -190,6 +190,35 @@ async function refresh() {
   return status;
 }
 
+async function refreshUpdate() {
+  const u = await invoke("update_status");
+  const box = document.getElementById("update");
+  if (u.state === "ready") {
+    document.getElementById("update-text").textContent = `Seam ${u.version} is ready.`;
+    box.hidden = false;
+  } else {
+    box.hidden = true;
+  }
+  let v = document.getElementById("version");
+  if (!v) {
+    v = el("p", { id: "version", className: "version" });
+    document.body.append(v);
+  }
+  v.textContent = `Seam ${u.current}`;
+}
+
+document.getElementById("update-btn").addEventListener("click", async (e) => {
+  e.target.disabled = true;
+  e.target.textContent = "Restarting…";
+  try {
+    await invoke("restart_to_update");
+  } catch (err) {
+    showError(String(err));
+    e.target.disabled = false;
+    e.target.textContent = "Restart";
+  }
+});
+
 async function waitForLink() {
   // The link server starts in the background; give it a few seconds.
   for (let i = 0; i < 30; i++) {
@@ -213,4 +242,6 @@ async function waitForLink() {
     await invoke("frontend_ready", { ok: false, detail: `startup error: ${e}` }).catch(() => {});
   }
   setInterval(() => refresh().catch((e) => showError(String(e))), 2000);
+  refreshUpdate().catch(() => {});
+  setInterval(() => refreshUpdate().catch(() => {}), 60000);
 })();

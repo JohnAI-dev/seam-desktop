@@ -1,6 +1,7 @@
 //! Seam desktop app: the window, and the commands its UI calls.
 
 mod link;
+mod updates;
 
 use seam_core::{adb, scrcpy, tools, tools::Tool};
 use serde::Serialize;
@@ -102,6 +103,16 @@ fn dismiss_notification(phone_link: State<link::Link>, phone: String, id: String
     phone_link.dismiss_notification(&phone, &id);
 }
 
+#[tauri::command]
+fn update_status(app: AppHandle, pending: State<updates::Updates>) -> updates::UpdateStatus {
+    pending.status(&app.package_info().version.to_string())
+}
+
+#[tauri::command]
+fn restart_to_update(app: AppHandle) -> Result<(), String> {
+    updates::install_and_restart(&app)
+}
+
 /// Called by the UI once it has rendered. In self-test mode this ends the app with
 /// a pass/fail exit code, so CI can prove the real window starts and works.
 #[tauri::command]
@@ -147,10 +158,15 @@ pub fn run() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updates::Updates::default())
         .manage(SelfTest(self_test))
         .setup(move |app| {
             use_bundled_tools(app.handle());
             app.manage(link::start(app.handle(), !self_test));
+            if !self_test {
+                updates::start(app.handle());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -160,6 +176,8 @@ pub fn run() {
             start_pairing,
             forget_phone,
             dismiss_notification,
+            update_status,
+            restart_to_update,
             frontend_ready
         ])
         .run(tauri::generate_context!())
