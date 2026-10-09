@@ -1,5 +1,7 @@
 //! Seam desktop app: the window, and the commands its UI calls.
 
+mod link;
+
 use seam_core::{adb, scrcpy, tools, tools::Tool};
 use serde::Serialize;
 use std::time::Duration;
@@ -80,6 +82,21 @@ fn start_mirror(serial: String, name: String) -> Result<(), String> {
     .map(|_child| ())
 }
 
+#[tauri::command]
+fn link_status(phone_link: State<link::Link>) -> link::LinkStatus {
+    phone_link.status()
+}
+
+#[tauri::command]
+fn start_pairing(phone_link: State<link::Link>) -> Result<link::PairingView, String> {
+    phone_link.start_pairing()
+}
+
+#[tauri::command]
+fn forget_phone(phone_link: State<link::Link>, id: String) -> Result<(), String> {
+    phone_link.forget(&id)
+}
+
 /// Called by the UI once it has rendered. In self-test mode this ends the app with
 /// a pass/fail exit code, so CI can prove the real window starts and works.
 #[tauri::command]
@@ -124,14 +141,19 @@ pub fn run() {
         });
     }
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(SelfTest(self_test))
-        .setup(|app| {
+        .setup(move |app| {
             use_bundled_tools(app.handle());
+            app.manage(link::start(app.handle(), !self_test));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             status,
             start_mirror,
+            link_status,
+            start_pairing,
+            forget_phone,
             frontend_ready
         ])
         .run(tauri::generate_context!())

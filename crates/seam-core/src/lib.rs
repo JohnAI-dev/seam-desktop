@@ -2,5 +2,6 @@
 //! tested on its own.
 
 pub mod adb;
+pub mod link;
 pub mod scrcpy;
 pub mod tools;

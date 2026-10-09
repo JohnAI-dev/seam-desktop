@@ -8,6 +8,9 @@ Your phone and your computer, as one. One codebase for Linux, Mac and Windows, b
 
 - Finds your Android phone over USB or Wi-Fi (via `adb`) and shows its status.
 - **Mirror**: opens your phone's screen in a window you can control (via `scrcpy`).
+- **Phone app link (no USB debugging):** pair the Seam Android app by scanning a QR code;
+  phone notifications and battery then show up on the computer over Wi-Fi, end-to-end
+  encrypted (TLS with the certificate pinned via the QR code). Protocol: `protocol/PROTOCOL.md`.
 - `adb` and `scrcpy` are **built in** (downloaded at build time by `scripts/fetch_tools.py`,
   pinned version, checksum-verified), so there is nothing else to install.
 

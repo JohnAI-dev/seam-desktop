@@ -13,8 +13,30 @@
   </header>
 
   <main>
+    <section aria-labelledby="app-h">
+      <div class="section-head">
+        <h2 id="app-h">Phone app</h2>
+        <button id="pair-btn" class="secondary">Pair phone</button>
+      </div>
+      <div id="pairing" class="pairing" hidden>
+        <div id="qr" class="qr" aria-label="Pairing QR code"></div>
+        <p>Open the camera on your phone and scan this code. It opens the Seam app and pairs it with this computer.</p>
+        <p class="hint">The code works once and expires in <span id="pair-expiry">10</span> minutes. No USB debugging needed.</p>
+        <button id="pair-done" class="secondary">Done</button>
+      </div>
+      <ul id="linked" aria-live="polite"></ul>
+      <p id="linked-empty" class="hint">No phone paired yet. Install the Seam app on your phone, then press <strong>Pair phone</strong>.</p>
+      <p id="link-error" class="error" hidden></p>
+    </section>
+
+    <section aria-labelledby="notif-h">
+      <h2 id="notif-h">Phone notifications</h2>
+      <ul id="notifications" class="notifications" aria-live="polite"></ul>
+      <p id="notif-empty" class="hint">Notifications from your phone show up here and on your desktop.</p>
+    </section>
+
     <section aria-labelledby="phones-h">
-      <h2 id="phones-h">Phones</h2>
+      <h2 id="phones-h">USB / debugging connection</h2>
       <ul id="devices" aria-live="polite"></ul>
       <p id="empty" class="hint" hidden>
         No phone found. Connect it with USB and turn on <strong>USB debugging</strong>

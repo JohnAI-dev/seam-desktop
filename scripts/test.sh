@@ -41,4 +41,8 @@ for tool in adb scrcpy; do
     exit 1
   fi
 done
+if ! echo "$summary" | grep -q "link listening on"; then
+  echo "::error title=Self-test failed::the phone link did not start: $summary"
+  exit 1
+fi
 echo "self-test passed: $summary"

@@ -1,0 +1,38 @@
+{
+  "proofs": [
+    {
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "nonce": "00112233445566778899aabbccddeeff",
+      "device_id": "4f1c2b7e-9a0d-4c55-8b1e-2f3a4b5c6d7e",
+      "proof": "079f51469948dfe39fe07d58ccd5df77c65ead499a2e52b95d5c14accea45c5c"
+    },
+    {
+      "key": "4D6WVhj0yb3p_jbh9_aKBAtm3LorzTroTK9Q56OJmqk",
+      "nonce": "ffeeddccbbaa99887766554433221100",
+      "device_id": "phone-2",
+      "proof": "a6bb37c1465bb3d5ebfb8ead9074d9caaa152f4010082b3e1bf1deb84a75c7b6"
+    }
+  ],
+  "pair_uri": {
+    "uri": "seam://pair?v=1&host=192.168.1.10,10.0.0.5&port=47100&fp=abababababababababababababababababababababababababababababababab&key=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&name=Johns%20MacBook%20Air",
+    "parsed": {
+      "version": 1,
+      "hosts": [
+        "192.168.1.10",
+        "10.0.0.5"
+      ],
+      "port": 47100,
+      "fingerprint": "abababababababababababababababababababababababababababababababab",
+      "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "name": "Johns MacBook Air"
+    }
+  },
+  "invalid_pair_uris": [
+    "https://example.com/pair?v=1",
+    "seam://pair?v=2&host=1.2.3.4&port=47100&fp=abababababababababababababababababababababababababababababababab&key=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&name=x",
+    "seam://pair?v=1&host=1.2.3.4&port=47100&fp=abcd&key=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&name=x",
+    "seam://pair?v=1&host=1.2.3.4&port=notaport&fp=abababababababababababababababababababababababababababababababab&key=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&name=x",
+    "seam://pair?v=1&port=47100&fp=abababababababababababababababababababababababababababababababab&key=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&name=x",
+    "seam://pair?v=1&host=1.2.3.4&port=47100&fp=abababababababababababababababababababababababababababababababab&key=c2hvcnQ&name=x"
+  ]
+}
