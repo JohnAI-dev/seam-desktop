@@ -39,14 +39,20 @@ pub fn mirror_args(serial: &str, window_title: &str, opts: &MirrorOptions) -> Ve
 }
 
 /// Start mirroring in its own window. Returns the running scrcpy process.
+///
+/// `adb` tells scrcpy which adb to use, so it uses the same one as Seam.
 pub fn spawn_mirror(
     scrcpy: &Path,
+    adb: Option<&Path>,
     serial: &str,
     window_title: &str,
     opts: &MirrorOptions,
 ) -> Result<Child, String> {
-    Command::new(scrcpy)
-        .args(mirror_args(serial, window_title, opts))
+    let mut cmd = Command::new(scrcpy);
+    if let Some(adb) = adb {
+        cmd.env("ADB", adb);
+    }
+    cmd.args(mirror_args(serial, window_title, opts))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

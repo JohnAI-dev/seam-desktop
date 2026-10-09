@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 /src-tauri/gen/
+/src-tauri/resources/tools/*
+!/src-tauri/resources/tools/.gitkeep

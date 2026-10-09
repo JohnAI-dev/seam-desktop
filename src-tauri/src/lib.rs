@@ -3,7 +3,7 @@
 use seam_core::{adb, scrcpy, tools, tools::Tool};
 use serde::Serialize;
 use std::time::Duration;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 /// Whether the app was started with `--self-test` (launch, render, report, exit).
 struct SelfTest(bool);
@@ -13,6 +13,8 @@ struct SelfTest(bool);
 struct ToolStatus {
     found: bool,
     version: Option<String>,
+    /// True when Seam is using the copy that ships inside the app.
+    bundled: bool,
 }
 
 /// Everything the main window shows.
@@ -31,6 +33,7 @@ fn tool_status(tool: Tool) -> (ToolStatus, Option<std::path::PathBuf>) {
         ToolStatus {
             found: path.is_some(),
             version,
+            bundled: path.as_deref().is_some_and(tools::is_bundled),
         },
         path,
     )
@@ -66,8 +69,10 @@ fn status() -> Status {
 #[tauri::command]
 fn start_mirror(serial: String, name: String) -> Result<(), String> {
     let scrcpy_path = tools::find(Tool::Scrcpy).ok_or("scrcpy is not installed")?;
+    let adb_path = tools::find(Tool::Adb);
     scrcpy::spawn_mirror(
         &scrcpy_path,
+        adb_path.as_deref(),
         &serial,
         &format!("Seam - {name}"),
         &scrcpy::MirrorOptions::default(),
@@ -85,6 +90,30 @@ fn frontend_ready(app: AppHandle, self_test: State<SelfTest>, ok: bool, detail: 
     }
 }
 
+/// Point tool lookup at the adb and scrcpy shipped inside the app, if present.
+/// Failure is not fatal: Seam then falls back to tools installed on the computer.
+fn use_bundled_tools(app: &AppHandle) {
+    let found = app
+        .path()
+        .resource_dir()
+        .map(|d| d.join("tools"))
+        .ok()
+        .filter(|d| d.join(tools::VERSION_FILE).exists());
+    let Some(src) = found else {
+        eprintln!("Seam: no built-in tools found; using tools installed on this computer");
+        return;
+    };
+    let cache = app
+        .path()
+        .app_local_data_dir()
+        .map(|d| d.join("tools"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("seam-tools"));
+    match tools::prepare_bundled(&src, &cache) {
+        Ok(dir) => tools::set_bundled_dir(dir),
+        Err(e) => eprintln!("Seam: could not prepare built-in tools: {e}"),
+    }
+}
+
 pub fn run() {
     let self_test = std::env::args().any(|a| a == "--self-test");
     if self_test {
@@ -96,6 +125,10 @@ pub fn run() {
     }
     tauri::Builder::default()
         .manage(SelfTest(self_test))
+        .setup(|app| {
+            use_bundled_tools(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             status,
             start_mirror,

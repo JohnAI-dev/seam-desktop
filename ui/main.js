@@ -57,7 +57,7 @@ function renderTools(status) {
   const rows = ["adb", "scrcpy"].map((key) => {
     const t = status[key];
     const right = t.found
-      ? el("span", { className: "ok", textContent: t.version || "found" })
+      ? el("span", { className: "ok", textContent: `${t.version || "found"}${t.bundled ? " · built in" : ""}` })
       : el("span", { className: "missing", textContent: "missing", title: INSTALL_HINT[key] });
     return el("li", {}, el("span", { textContent: key }), right);
   });
@@ -85,7 +85,7 @@ async function refresh() {
     const rendered = document.querySelectorAll("#tools li").length === 2;
     await invoke("frontend_ready", {
       ok: rendered,
-      detail: `window rendered; adb ${status.adb.found ? "found" : "missing"}, scrcpy ${status.scrcpy.found ? "found" : "missing"}, ${status.devices.length} device(s)`,
+      detail: `window rendered; adb ${status.adb.found ? "found" : "missing"}${status.adb.bundled ? " (built in)" : ""}, scrcpy ${status.scrcpy.found ? "found" : "missing"}${status.scrcpy.bundled ? " (built in)" : ""}, ${status.devices.length} device(s)`,
     });
   } catch (e) {
     await invoke("frontend_ready", { ok: false, detail: `startup error: ${e}` }).catch(() => {});

@@ -8,9 +8,10 @@ Your phone and your computer, as one. One codebase for Linux, Mac and Windows, b
 
 - Finds your Android phone over USB or Wi-Fi (via `adb`) and shows its status.
 - **Mirror**: opens your phone's screen in a window you can control (via `scrcpy`).
-- Shows whether `adb` and `scrcpy` are installed, with install hints if not.
+- `adb` and `scrcpy` are **built in** (downloaded at build time by `scripts/fetch_tools.py`,
+  pinned version, checksum-verified), so there is nothing else to install.
 
-On Arch: `sudo pacman -S android-tools scrcpy`, then run the `.AppImage` from the latest release.
+On Linux (incl. Arch) run the `.AppImage` from the latest release; on Mac open the `.dmg`.
 
 ## How it gets built (autonomous)
 

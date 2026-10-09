@@ -29,9 +29,11 @@ jobs:
     steps:
       - id: m
         run: |
-          linux='{"os":"ubuntu-24.04","bundles":"deb,appimage"}'
+          linux='{"os":"ubuntu-24.04","bundles":"deb,appimage","tools":"linux-x86_64"}'
+          mac='{"os":"macos-latest","bundles":"dmg","tools":"macos-aarch64"}'
+          win='{"os":"windows-latest","bundles":"nsis","tools":"win64"}'
           if [ "${{ inputs.all_platforms }}" = "true" ]; then
-            echo "matrix={\"include\":[$linux,{\"os\":\"macos-latest\",\"bundles\":\"dmg\"},{\"os\":\"windows-latest\",\"bundles\":\"nsis\"}]}" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[$linux,$mac,$win]}" >> "$GITHUB_OUTPUT"
           else
             echo "matrix={\"include\":[$linux]}" >> "$GITHUB_OUTPUT"
           fi
@@ -55,6 +57,11 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch built-in adb and scrcpy
+        run: python scripts/fetch_tools.py ${{ matrix.tools }}
       - name: Build installers
         shell: bash
         env:
@@ -100,6 +107,6 @@ jobs:
           - **Mac (Apple Silicon):** open the .dmg and drag Seam to Applications. The app is not signed yet, so the first time: right-click Seam → Open → Open.
           - **Windows:** run the -setup.exe. Windows may warn about an unknown publisher: More info → Run anyway.
 
-          Seam needs adb and scrcpy (Arch: pacman -S android-tools scrcpy, Mac: brew install android-platform-tools scrcpy).")
+          adb and scrcpy are built in; nothing else to install.")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "Released: $url"
