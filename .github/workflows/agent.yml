@@ -25,7 +25,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.sender.login == github.repository_owner &&
-       (github.event.action == 'opened' || github.event.label.name == 'agent') &&
+       github.event.issue.state == 'open' &&
+       ((github.event.action == 'opened' && !contains(github.event.issue.labels.*.name, 'agent')) ||
+        github.event.label.name == 'agent') &&
        !contains(github.event.issue.labels.*.name, 'no-agent'))
     runs-on: ubuntu-latest
     timeout-minutes: 240
