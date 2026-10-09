@@ -56,6 +56,14 @@ pub enum Message {
         level: u8,
         charging: bool,
     },
+    /// Desktop → phone: cancel this notification on the phone.
+    Dismiss {
+        id: String,
+    },
+    /// Either direction: put this text on the receiver's clipboard.
+    Clipboard {
+        text: String,
+    },
     Ping,
     Pong,
     /// Any message type this build doesn't know. Ignored, so newer phones still work.
@@ -290,6 +298,8 @@ mod tests {
                 charging: true,
             },
             Message::Ping,
+            Message::Dismiss { id: "k".into() },
+            Message::Clipboard { text: "hei".into() },
         ];
         for m in msgs {
             assert_eq!(Message::from_line(&m.to_line()).unwrap(), m);

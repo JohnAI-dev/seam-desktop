@@ -5,6 +5,7 @@ use super::store::{PairedDevice, Store};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -64,6 +65,8 @@ struct Inner {
     acceptor: TlsAcceptor,
     pending: Mutex<Option<Pending>>,
     events: mpsc::UnboundedSender<LinkEvent>,
+    /// Outgoing queues of the phones connected right now.
+    outboxes: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
 }
 
 /// The link server. Cheap to clone; all clones share state.
@@ -99,6 +102,7 @@ impl LinkServer {
             acceptor: TlsAcceptor::from(Arc::new(config)),
             pending: Mutex::new(None),
             events,
+            outboxes: Mutex::new(HashMap::new()),
         };
         Ok((
             Self {
@@ -119,6 +123,27 @@ impl LinkServer {
 
     pub fn paired_devices(&self) -> Vec<PairedDevice> {
         self.inner.store.devices()
+    }
+
+    /// Send a message to a connected phone. Returns false if it isn't connected.
+    pub fn send_to(&self, device_id: &str, msg: Message) -> bool {
+        self.inner
+            .outboxes
+            .lock()
+            .unwrap()
+            .get(device_id)
+            .is_some_and(|tx| tx.send(msg).is_ok())
+    }
+
+    /// Ids of the phones connected right now.
+    pub fn connected(&self) -> Vec<String> {
+        self.inner
+            .outboxes
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub fn forget(&self, device_id: &str) -> io::Result<bool> {
@@ -283,6 +308,7 @@ impl LinkServer {
         &self,
         device_id: &str,
         frames: &mut mpsc::Receiver<Result<Message, String>>,
+        outbox: &mut mpsc::UnboundedReceiver<Message>,
         writer: &mut W,
     ) -> io::Result<()> {
         let mut ping = tokio::time::interval(PING_INTERVAL);
@@ -305,6 +331,7 @@ impl LinkServer {
                         Message::Notification(n) => Some(LinkEvent::Notification { device_id: id, notification: n }),
                         Message::NotificationRemoved { id: nid } => Some(LinkEvent::NotificationRemoved { device_id: id, id: nid }),
                         Message::Battery { level, charging } => Some(LinkEvent::Battery { device_id: id, level: level.min(100), charging }),
+                        Message::Clipboard { text } => Some(LinkEvent::Clipboard { device_id: id, text }),
                         Message::Pong => { missed_pongs = 0; None }
                         Message::Ping => { send(writer, &Message::Pong).await?; None }
                         _ => None,
@@ -312,6 +339,9 @@ impl LinkServer {
                     if let Some(e) = event {
                         let _ = self.inner.events.send(e);
                     }
+                }
+                Some(msg) = outbox.recv() => {
+                    send(writer, &msg).await?;
                 }
                 _ = ping.tick() => {
                     missed_pongs += 1;

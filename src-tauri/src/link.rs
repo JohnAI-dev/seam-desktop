@@ -240,6 +240,8 @@ fn handle_event(
             LinkEvent::NotificationRemoved { id, .. } => {
                 s.notifications.retain(|n| n.notification.id != id);
             }
+            // Clipboard sync is not implemented in the app yet (see the issue tracker).
+            LinkEvent::Clipboard { .. } => {}
         }
     }
     if let (Some(n), true) = (show, system_notifications) {

@@ -192,3 +192,42 @@ async fn forgotten_phone_cannot_reconnect() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn desktop_can_send_to_a_connected_phone_and_receive_clipboard() {
+    let (server, mut events, port) = start("send").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "P")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    assert_eq!(server.connected(), vec!["phone-1".to_string()]);
+    assert!(server.send_to("phone-1", Message::Dismiss { id: "k1".into() }));
+    assert!(!server.send_to("nobody", Message::Ping));
+    let got = tokio::time::timeout(Duration::from_secs(5), phone.recv())
+        .await
+        .unwrap();
+    assert_eq!(got, Some(Message::Dismiss { id: "k1".into() }));
+
+    phone
+        .send(&Message::Clipboard {
+            text: "fra mobilen".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Clipboard {
+            device_id: "phone-1".into(),
+            text: "fra mobilen".into()
+        }
+    );
+
+    phone.close().await;
+    while !matches!(
+        next_event(&mut events).await,
+        LinkEvent::Disconnected { .. }
+    ) {}
+    assert!(server.connected().is_empty());
+}

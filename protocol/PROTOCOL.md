@@ -58,6 +58,25 @@ Desktop → phone:
 | type | fields |
 |---|---|
 | `ping` | — (sent every 30 s; the phone answers `pong`) |
+| `dismiss` | `id` — the person dismissed this notification on the computer; the phone should cancel it |
+
+Both directions:
+
+| type | fields |
+|---|---|
+| `clipboard` | `text` (at most 100 000 characters) — the sender's clipboard changed or the person chose "send clipboard"; the receiver puts it on its clipboard |
+
+## Finding the computer after its address changes
+
+The desktop advertises itself on the local network with mDNS/DNS-SD:
+
+- service type `_seam._tcp`, port = the link port
+- TXT record `fp=<64 hex chars>` = its certificate fingerprint
+
+When none of the stored hosts answer, the phone browses for `_seam._tcp`, picks the service
+whose `fp` equals the paired fingerprint, connects to its address, and updates the stored
+hosts. The fingerprint check (and TLS pinning) means a different computer can never be
+picked by mistake.
 
 Unknown message types must be ignored by both sides, so new features can be added
 without breaking older versions.
