@@ -51,6 +51,10 @@ pub enum LinkEvent {
         level: u8,
         charging: bool,
     },
+    Clipboard {
+        device_id: String,
+        text: String,
+    },
 }
 
 struct Pending {
@@ -254,7 +258,16 @@ impl LinkServer {
             name,
         });
 
-        let result = self.session(&device_id, &mut frames, &mut writer).await;
+        let (out_tx, mut outbox) = mpsc::unbounded_channel();
+        self.inner
+            .outboxes
+            .lock()
+            .unwrap()
+            .insert(device_id.clone(), out_tx);
+        let result = self
+            .session(&device_id, &mut frames, &mut outbox, &mut writer)
+            .await;
+        self.inner.outboxes.lock().unwrap().remove(&device_id);
         let _ = self
             .inner
             .events
