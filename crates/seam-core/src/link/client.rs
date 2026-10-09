@@ -2,7 +2,7 @@
 //! desktop's tests (and future tools) act as a phone, following the same protocol.
 
 use super::protocol::{self, Message, PairingInfo};
-use super::server::spawn_reader;
+use super::server::{spawn_reader, AbortOnDrop};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, WriteHalf};
@@ -82,6 +82,8 @@ impl ServerCertVerifier for PinnedCert {
 pub struct PhoneClient {
     writer: WriteHalf<TlsStream<TcpStream>>,
     frames: mpsc::Receiver<Result<Message, String>>,
+    /// Dropping the client stops the reader, which fully closes the connection.
+    _reader: AbortOnDrop,
     pub desktop_name: String,
 }
 
@@ -110,9 +112,11 @@ impl PhoneClient {
             .connect(server_name, tcp)
             .await?;
         let (read_half, writer) = tokio::io::split(tls);
+        let (frames, reader) = spawn_reader(read_half);
         let mut client = Self {
             writer,
-            frames: spawn_reader(read_half),
+            frames,
+            _reader: AbortOnDrop(reader),
             desktop_name: String::new(),
         };
         let nonce = match client.recv().await {
@@ -143,6 +147,11 @@ impl PhoneClient {
         line.push('\n');
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await
+    }
+
+    /// Hang up cleanly.
+    pub async fn close(mut self) {
+        let _ = self.writer.shutdown().await;
     }
 
     /// Next message, or `None` when the connection closed.

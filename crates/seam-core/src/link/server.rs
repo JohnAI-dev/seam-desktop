@@ -176,7 +176,10 @@ impl LinkServer {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
         let (read_half, mut writer) = tokio::io::split(tls);
-        let mut frames = spawn_reader(read_half);
+        let (mut frames, reader) = spawn_reader(read_half);
+        // The reader task owns half of the connection; stop it when we're done so the
+        // connection really closes.
+        let _abort_reader = AbortOnDrop(reader);
 
         let mut nonce = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -322,6 +325,15 @@ impl LinkServer {
     }
 }
 
+/// Aborts a task when dropped.
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn send<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> io::Result<()> {
     let mut line = msg.to_line();
     line.push('\n');
@@ -345,9 +357,12 @@ async fn reject<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, reason: &str) -> io
 /// cancelled mid-line. Lines longer than `MAX_FRAME` end the connection.
 pub(crate) fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
     read_half: R,
-) -> mpsc::Receiver<Result<Message, String>> {
+) -> (
+    mpsc::Receiver<Result<Message, String>>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::channel(64);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut reader = BufReader::new(read_half);
         loop {
             let mut buf = Vec::new();
@@ -378,7 +393,7 @@ pub(crate) fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
             }
         }
     });
-    rx
+    (rx, task)
 }
 
 /// The computer's address on the local network, as phones would reach it.

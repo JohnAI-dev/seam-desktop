@@ -18,7 +18,18 @@ step "lint"
 cargo clippy --workspace --all-targets -- -D warnings
 
 step "unit tests"
-cargo test --workspace
+set +e
+test_out=$(cargo test --workspace 2>&1)
+test_code=$?
+set -e
+echo "$test_out"
+if [ $test_code -ne 0 ]; then
+  # Surface failing tests and their panic messages as annotations.
+  echo "$test_out" | grep -E "^test .* FAILED$|panicked at|left:|right:|^thread '" | head -20 | while IFS= read -r l; do
+    echo "::error title=Unit test failed::$l"
+  done
+  exit 1
+fi
 
 step "build app"
 cargo build -p seam-desktop

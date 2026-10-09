@@ -107,7 +107,7 @@ async fn phone_pairs_sends_notification_and_battery_then_reconnects() {
         }
     );
 
-    drop(phone);
+    phone.close().await;
     assert_eq!(
         next_event(&mut events).await,
         LinkEvent::Disconnected {
