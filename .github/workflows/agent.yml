@@ -15,16 +15,35 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  actions: read
 concurrency:
   group: agent-issue-${{ github.event.issue.number || inputs.issue }}
   cancel-in-progress: false
 jobs:
-  fix:
+  wait-turn:
+    # Agents in one repo take turns (oldest first), so their changes never collide.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.sender.login == github.repository_owner &&
        (github.event.action == 'opened' || github.event.label.name == 'agent') &&
        !contains(github.event.issue.labels.*.name, 'no-agent'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Wait for earlier agent runs in this repo to finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while true; do
+            older=$(gh api "repos/${{ github.repository }}/actions/workflows/agent.yml/runs?per_page=50" \
+              --jq "[.workflow_runs[] | select(.id < ${{ github.run_id }} and (.status == \"in_progress\" or .status == \"queued\" or .status == \"waiting\"))] | length")
+            [ "$older" = "0" ] && break
+            echo "Waiting for $older earlier agent run(s) to finish..."
+            sleep 30
+          done
+
+  fix:
+    needs: wait-turn
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     outputs:
