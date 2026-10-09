@@ -1,0 +1,18 @@
+[package]
+name = "seam-desktop"
+description = "Seam: your phone and your computer, as one."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "seam-desktop"
+
+[lib]
+name = "seam_desktop_lib"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+seam-core = { path = "../crates/seam-core" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }

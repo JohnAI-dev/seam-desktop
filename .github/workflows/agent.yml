@@ -1,0 +1,92 @@
+name: Grok agent
+# Fully autonomous: issue -> Grok fix + Grok review -> independent CI -> auto-merge -> release.
+#
+# Triggers only for issues from the repo owner, or when the owner adds the "agent" label
+# to someone else's issue. Issues from strangers never reach Grok (prompt-injection guard).
+on:
+  issues:
+    types: [opened, labeled]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue number to (re)run the agent on
+        required: true
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+concurrency:
+  group: agent-issue-${{ github.event.issue.number || inputs.issue }}
+  cancel-in-progress: false
+jobs:
+  fix:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.sender.login == github.repository_owner &&
+       (github.event.action == 'opened' || github.event.label.name == 'agent') &&
+       !contains(github.event.issue.labels.*.name, 'no-agent'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    outputs:
+      branch: ${{ steps.agent.outputs.branch }}
+      pr: ${{ steps.agent.outputs.pr }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install system libraries
+        run: bash scripts/install-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Load issue for manual runs
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/${{ inputs.issue }} \
+            | jq '{issue: .}' > "$RUNNER_TEMP/event.json"
+          echo "GITHUB_EVENT_PATH=$RUNNER_TEMP/event.json" >> "$GITHUB_ENV"
+      - name: Grok fixes and reviews
+        id: agent
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          XAI_MODEL: ${{ vars.XAI_MODEL }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/agent/grok_agent.py
+
+  test:
+    needs: fix
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.fix.outputs.branch }}
+
+  merge:
+    needs: [fix, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Squash-merge the approved PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT repos/${{ github.repository }}/pulls/${{ needs.fix.outputs.pr }}/merge \
+            -f merge_method=squash
+          gh api -X DELETE repos/${{ github.repository }}/git/refs/heads/${{ needs.fix.outputs.branch }} || true
+
+  release:
+    needs: merge
+    uses: ./.github/workflows/release.yml
+
+  close-issue:
+    needs: [fix, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close the issue with a link to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number || inputs.issue }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/$ISSUE/comments \
+            -f body="🤖 Fixed in #${{ needs.fix.outputs.pr }}, merged and released: ${{ needs.release.outputs.url }}"
+          gh api -X PATCH repos/${{ github.repository }}/issues/$ISSUE -f state=closed -f state_reason=completed

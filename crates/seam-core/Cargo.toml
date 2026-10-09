@@ -1,0 +1,9 @@
+[package]
+name = "seam-core"
+description = "Phone connection logic for Seam: finding tools, talking to adb, launching scrcpy."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

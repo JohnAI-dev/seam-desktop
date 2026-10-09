@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seam</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Seam</h1>
+    <p class="tagline">Your phone and your computer, as one.</p>
+  </header>
+
+  <main>
+    <section aria-labelledby="phones-h">
+      <h2 id="phones-h">Phones</h2>
+      <ul id="devices" aria-live="polite"></ul>
+      <p id="empty" class="hint" hidden>
+        No phone found. Connect it with USB and turn on <strong>USB debugging</strong>
+        in Developer options, then accept the prompt on the phone.
+      </p>
+      <p id="error" class="error" hidden></p>
+    </section>
+
+    <section aria-labelledby="tools-h">
+      <h2 id="tools-h">Setup</h2>
+      <ul id="tools" class="tools"></ul>
+    </section>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>

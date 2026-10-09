@@ -1,0 +1,36 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+permissions:
+  contents: write  # lets CI commit an updated Cargo.lock on main
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Install system libraries
+        run: bash scripts/install-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (format, lint, unit tests, build, launch app)
+        run: bash scripts/test.sh
+      - name: Commit Cargo.lock if it changed
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          if [ -n "$(git status --porcelain Cargo.lock)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock && git commit -m "Update Cargo.lock" && git push
+          fi
