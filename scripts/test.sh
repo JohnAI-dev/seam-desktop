@@ -4,6 +4,7 @@
 # render the UI, call into Rust, and find the adb and scrcpy that ship inside it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export CARGO_TERM_COLOR=never
 CURRENT="setup"
 step() { CURRENT="$*"; echo; echo "== $*"; }
 trap 'echo "::error title=Test failed::Step \"$CURRENT\" failed"' ERR
@@ -20,10 +21,10 @@ checked() {
   set -e
   echo "$out"
   if [ $code -ne 0 ]; then
-    echo "$out" | grep -E "^(error|warning)(\[|:)|^ *--> |^Diff in " | head -20 | while IFS= read -r l; do
-      echo "::error title=$CURRENT::$l"
-    done
-    return $code
+    { echo "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -E "^(error|warning)(\[|:)|^ *--> |^Diff in " || true; } \
+      | head -20 | while IFS= read -r l; do echo "::error title=$CURRENT::$l"; done
+    echo "::error title=Test failed::Step \"$CURRENT\" failed"
+    exit $code
   fi
 }
 
