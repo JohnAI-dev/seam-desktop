@@ -24,7 +24,11 @@ function renderDevices(status) {
   list.replaceChildren(
     ...status.devices.map((d) => {
       const name = d.model || d.serial;
-      const meta = `${STATE_TEXT[d.state] || d.state} · ${d.wireless ? "Wi-Fi" : "USB"}`;
+      let meta = `${STATE_TEXT[d.state] || d.state} · ${d.wireless ? "Wi-Fi" : "USB"}`;
+      if (d.battery) {
+        meta += ` · ${d.battery.level}%`;
+        if (d.battery.charging) meta += " ⚡";
+      }
       const btn = el("button", { textContent: "Mirror" });
       btn.disabled = d.state !== "device" || !status.scrcpy.found;
       btn.addEventListener("click", async () => {
