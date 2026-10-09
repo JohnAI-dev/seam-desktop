@@ -87,7 +87,9 @@ jobs:
         run: |
           sha=$(gh api repos/${{ github.repository }}/commits/main --jq .sha)
           tag="build-$(date -u +%Y%m%d-%H%M%S)-${sha:0:7}"
-          url=$(gh release create "$tag" dist/* --repo ${{ github.repository }} --target "$sha" \
+          mapfile -t files < <(find dist -type f)
+          printf "  %s\n" "${files[@]}"
+          url=$(gh release create "$tag" "${files[@]}" --repo ${{ github.repository }} --target "$sha" \
                 --title "Seam $(date -u +%Y-%m-%d) (${sha:0:7})" \
                 --notes "Automatic build of main at ${sha:0:7}. Install the .deb (Debian/Ubuntu) or run the .AppImage (any Linux, incl. Arch).")
           echo "url=$url" >> "$GITHUB_OUTPUT"
