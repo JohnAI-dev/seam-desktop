@@ -1,7 +1,7 @@
 //! The phone link inside the app: runs the server, keeps what the window shows,
 //! and turns phone notifications into notifications on this computer.
 
-use seam_core::link::{self, LinkEvent, LinkServer, PhoneNotification};
+use seam_core::link::{self, LinkEvent, LinkServer, Message, PhoneNotification};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -104,6 +104,22 @@ impl Link {
         s.notifications.retain(|n| n.phone != id);
         Ok(())
     }
+
+    /// Send this computer's clipboard text to a connected phone.
+    pub fn send_clipboard(&self, id: &str) -> Result<(), String> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        if !server.connected().iter().any(|connected| connected == id) {
+            return Err("that phone is not connected".into());
+        }
+        let text = truncate_clipboard(&computer_clipboard_text()?).to_string();
+        if !server.send_to(id, Message::Clipboard { text }) {
+            return Err("that phone is not connected".into());
+        }
+        Ok(())
+    }
 }
 
 fn desktop_name() -> String {
@@ -197,6 +213,7 @@ fn handle_event(
     event: LinkEvent,
 ) {
     let mut show: Option<PhoneNotification> = None;
+    let mut clipboard_text = None;
     {
         let mut s = shared.lock().unwrap();
         match event {
@@ -240,8 +257,9 @@ fn handle_event(
             LinkEvent::NotificationRemoved { id, .. } => {
                 s.notifications.retain(|n| n.notification.id != id);
             }
-            // Clipboard sync is not implemented in the app yet (see the issue tracker).
-            LinkEvent::Clipboard { .. } => {}
+            LinkEvent::Clipboard { text, .. } => {
+                clipboard_text = Some(text);
+            }
         }
     }
     if let (Some(n), true) = (show, system_notifications) {
@@ -257,5 +275,69 @@ fn handle_event(
             .title(title)
             .body(n.text)
             .show();
+    }
+    if let Some(text) = clipboard_text {
+        set_computer_clipboard(&text);
+    }
+}
+
+/// Protocol limit for clipboard text, in characters.
+const CLIPBOARD_MAX_CHARS: usize = 100_000;
+
+/// Cut `text` to at most `CLIPBOARD_MAX_CHARS` characters, without splitting one.
+fn truncate_clipboard(text: &str) -> &str {
+    match text.char_indices().nth(CLIPBOARD_MAX_CHARS) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
+}
+
+fn computer_clipboard_text() -> Result<String, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|e| format!("could not read the clipboard: {e}"))?;
+    let text = clipboard
+        .get_text()
+        .map_err(|_| "the clipboard has no text".to_string())?;
+    if text.is_empty() {
+        Err("the clipboard has no text".into())
+    } else {
+        Ok(text)
+    }
+}
+
+fn set_computer_clipboard(text: &str) {
+    // Headless machines (CI) have no clipboard; ignore that.
+    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+        let _ = clipboard.set_text(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate_clipboard, CLIPBOARD_MAX_CHARS};
+
+    #[test]
+    fn truncates_clipboard_to_100_000_characters() {
+        assert_eq!(truncate_clipboard(""), "");
+        assert_eq!(truncate_clipboard("hei"), "hei");
+        assert_eq!(truncate_clipboard("æøå"), "æøå");
+
+        let exact = "a".repeat(CLIPBOARD_MAX_CHARS);
+        assert_eq!(truncate_clipboard(&exact), exact);
+
+        let mut over = "b".repeat(CLIPBOARD_MAX_CHARS - 1);
+        over.push('æ');
+        over.push('z');
+        let cut = truncate_clipboard(&over);
+        assert_eq!(cut.chars().count(), CLIPBOARD_MAX_CHARS);
+        assert!(cut.ends_with('æ'));
+        assert!(!cut.contains('z'));
+        assert!(over.starts_with(cut));
+
+        let wide = "æ".repeat(CLIPBOARD_MAX_CHARS + 3);
+        assert_eq!(
+            truncate_clipboard(&wide).chars().count(),
+            CLIPBOARD_MAX_CHARS
+        );
     }
 }

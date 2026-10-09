@@ -97,6 +97,11 @@ fn forget_phone(phone_link: State<link::Link>, id: String) -> Result<(), String>
     phone_link.forget(&id)
 }
 
+#[tauri::command]
+fn send_clipboard(phone_link: State<link::Link>, id: String) -> Result<(), String> {
+    phone_link.send_clipboard(&id)
+}
+
 /// Called by the UI once it has rendered. In self-test mode this ends the app with
 /// a pass/fail exit code, so CI can prove the real window starts and works.
 #[tauri::command]
@@ -154,6 +159,7 @@ pub fn run() {
             link_status,
             start_pairing,
             forget_phone,
+            send_clipboard,
             frontend_ready
         ])
         .run(tauri::generate_context!())
