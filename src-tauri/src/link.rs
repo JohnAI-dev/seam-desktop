@@ -1,7 +1,7 @@
 //! The phone link inside the app: runs the server, keeps what the window shows,
 //! and turns phone notifications into notifications on this computer.
 
-use seam_core::link::{self, LinkEvent, LinkServer, PhoneNotification};
+use seam_core::link::{self, LinkEvent, LinkServer, Message, PhoneNotification};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -21,6 +21,11 @@ pub struct PhoneView {
     battery: Option<(u8, bool)>,
 }
 
+/// One row in the phone-notification list.
+///
+/// Serialized flat: `phone` and the `PhoneNotification` fields (`id`, `app`,
+/// `app_name`, `title`, `text`, `time`) are top-level keys. The dismiss button
+/// reads `n.phone` and `n.id` from that object, same as `n.app_name`.
 #[derive(Serialize, Clone)]
 pub struct NotificationView {
     phone: String,
@@ -50,6 +55,16 @@ struct Shared {
     error: Option<String>,
     phones: HashMap<String, PhoneView>,
     notifications: VecDeque<NotificationView>,
+}
+
+impl Shared {
+    /// Drop this phone's notification `id`, leaving every other entry in place.
+    fn remove_notification(&mut self, phone: &str, id: &str) -> bool {
+        let before = self.notifications.len();
+        self.notifications
+            .retain(|n| n.phone != phone || n.notification.id != id);
+        self.notifications.len() != before
+    }
 }
 
 /// App state for the link. `server` is `None` if it could not start.
@@ -103,6 +118,16 @@ impl Link {
         s.phones.remove(id);
         s.notifications.retain(|n| n.phone != id);
         Ok(())
+    }
+
+    /// Remove one notification from the window and tell that phone to cancel it.
+    /// If the phone is not connected, the notification is still removed locally.
+    pub fn dismiss_notification(&self, phone: &str, id: &str) {
+        self.shared.lock().unwrap().remove_notification(phone, id);
+        if let Some(server) = &self.server {
+            // False when the phone is offline; the list entry is already gone.
+            let _sent = server.send_to(phone, Message::Dismiss { id: id.to_string() });
+        }
     }
 }
 
@@ -257,5 +282,144 @@ fn handle_event(
             .title(title)
             .body(n.text)
             .show();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Link, NotificationView, Shared};
+    use seam_core::link::{LinkServer, PhoneNotification};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    fn view(phone: &str, id: &str) -> NotificationView {
+        NotificationView {
+            phone: phone.to_string(),
+            notification: PhoneNotification {
+                id: id.to_string(),
+                app: "com.example".into(),
+                app_name: "Example".into(),
+                title: String::new(),
+                text: String::new(),
+                time: 1,
+            },
+        }
+    }
+
+    fn ids(shared: &Shared) -> Vec<&str> {
+        shared
+            .notifications
+            .iter()
+            .map(|n| n.notification.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn removing_by_id_keeps_the_order_of_the_rest() {
+        let mut shared = Shared {
+            notifications: VecDeque::from([
+                view("phone-a", "n1"),
+                view("phone-a", "n2"),
+                view("phone-b", "n3"),
+                view("phone-a", "n4"),
+            ]),
+            ..Shared::default()
+        };
+
+        assert!(shared.remove_notification("phone-a", "n2"));
+        assert_eq!(ids(&shared).as_slice(), ["n1", "n3", "n4"]);
+
+        assert!(shared.remove_notification("phone-b", "n3"));
+        assert_eq!(ids(&shared).as_slice(), ["n1", "n4"]);
+
+        // Wrong phone or unknown id must not disturb the list.
+        assert!(!shared.remove_notification("phone-a", "missing"));
+        assert!(!shared.remove_notification("phone-b", "n1"));
+        assert_eq!(ids(&shared).as_slice(), ["n1", "n4"]);
+
+        assert!(shared.remove_notification("phone-a", "n1"));
+        assert!(shared.remove_notification("phone-a", "n4"));
+        assert!(shared.notifications.is_empty());
+        assert!(!shared.remove_notification("phone-a", "n1"));
+    }
+
+    #[test]
+    fn removes_only_matching_phone_and_keeps_the_other_phones_order() {
+        let mut shared = Shared {
+            notifications: VecDeque::from([
+                view("phone-a", "same"),
+                view("phone-b", "same"),
+                view("phone-a", "same"),
+                view("phone-b", "other"),
+            ]),
+            ..Shared::default()
+        };
+
+        assert!(shared.remove_notification("phone-a", "same"));
+        assert_eq!(ids(&shared).as_slice(), ["same", "other"]);
+        assert_eq!(shared.notifications[0].phone, "phone-b");
+        assert_eq!(shared.notifications[1].phone, "phone-b");
+    }
+
+    #[test]
+    fn link_status_flattens_phone_and_id_for_the_dismiss_button() {
+        let link = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared {
+                notifications: VecDeque::from([view("phone-a", "n1"), view("phone-b", "n2")]),
+                ..Shared::default()
+            })),
+        };
+        let json = serde_json::to_value(link.status()).unwrap();
+        let notes = json["notifications"].as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        // The window already reads app_name/title/text off this object. phone and id
+        // are siblings of those fields, not nested under "notification".
+        assert!(notes[0].get("notification").is_none());
+        assert_eq!(notes[0]["phone"].as_str(), Some("phone-a"));
+        assert_eq!(notes[0]["id"].as_str(), Some("n1"));
+        assert_eq!(notes[0]["app"].as_str(), Some("com.example"));
+        assert_eq!(notes[0]["app_name"].as_str(), Some("Example"));
+        assert_eq!(notes[0]["title"].as_str(), Some(""));
+        assert_eq!(notes[0]["text"].as_str(), Some(""));
+        assert_eq!(notes[0]["time"].as_i64(), Some(1));
+        assert_eq!(notes[1]["phone"].as_str(), Some("phone-b"));
+        assert_eq!(notes[1]["id"].as_str(), Some("n2"));
+
+        link.dismiss_notification("phone-a", "n1");
+        let json = serde_json::to_value(link.status()).unwrap();
+        let notes = json["notifications"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["phone"].as_str(), Some("phone-b"));
+        assert_eq!(notes[0]["id"].as_str(), Some("n2"));
+    }
+
+    #[test]
+    fn dismiss_removes_locally_when_the_phone_is_not_connected() {
+        let dir = std::env::temp_dir().join(format!("seam-dismiss-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Test Desktop".into()).unwrap();
+        assert!(server.connected().is_empty());
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared {
+                notifications: VecDeque::from([
+                    view("phone-a", "n1"),
+                    view("phone-a", "n2"),
+                    view("phone-b", "n3"),
+                ]),
+                ..Shared::default()
+            })),
+        };
+
+        link.dismiss_notification("phone-a", "n2");
+
+        let notes = link.status().notifications;
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].phone, "phone-a");
+        assert_eq!(notes[0].notification.id, "n1");
+        assert_eq!(notes[1].phone, "phone-b");
+        assert_eq!(notes[1].notification.id, "n3");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

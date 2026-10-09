@@ -17,3 +17,6 @@ seam-core = { path = "../crates/seam-core" }
 tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

@@ -95,12 +95,46 @@ function renderLink(link) {
 
   const notes = document.getElementById("notifications");
   notes.replaceChildren(
-    ...link.notifications.slice(0, 20).map((n) =>
-      el("li", {},
-        el("div", { className: "app", textContent: `${n.app_name || n.app} · ${new Date(n.time).toLocaleTimeString()}` }),
-        n.title ? el("div", { className: "title", textContent: n.title }) : "",
-        n.text ? el("div", { className: "text", textContent: n.text }) : ""),
-    ),
+    ...link.notifications.slice(0, 20).map((n) => {
+      const dismiss = el("button", {
+        className: "dismiss",
+        type: "button",
+        textContent: "\u00d7",
+        title: "Dismiss",
+      });
+      dismiss.setAttribute("aria-label", "Dismiss");
+      dismiss.addEventListener("click", async () => {
+        // link_status flattens NotificationView, so phone and id sit beside
+        // app_name/title/text (not under n.notification). See
+        // link_status_flattens_phone_and_id_for_the_dismiss_button.
+        const phone = n.phone;
+        const id = n.id;
+        if (typeof phone !== "string" || typeof id !== "string") {
+          showLinkError("could not dismiss this notification");
+          return;
+        }
+        dismiss.disabled = true;
+        try {
+          await invoke("dismiss_notification", { phone, id });
+          await refreshLink();
+        } catch (e) {
+          showLinkError(String(e));
+          dismiss.disabled = false;
+        }
+      });
+      return el(
+        "li",
+        {},
+        el(
+          "div",
+          { className: "body" },
+          el("div", { className: "app", textContent: `${n.app_name || n.app} · ${new Date(n.time).toLocaleTimeString()}` }),
+          n.title ? el("div", { className: "title", textContent: n.title }) : "",
+          n.text ? el("div", { className: "text", textContent: n.text }) : "",
+        ),
+        dismiss,
+      );
+    }),
   );
   document.getElementById("notif-empty").hidden = link.notifications.length > 0;
   showLinkError(link.error);
