@@ -17,6 +17,7 @@ rand = "0.8"
 base64 = "0.22"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+mdns-sd = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
