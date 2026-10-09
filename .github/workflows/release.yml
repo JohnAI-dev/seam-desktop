@@ -30,7 +30,7 @@ jobs:
       - id: m
         run: |
           linux='{"os":"ubuntu-24.04","bundles":"deb,appimage","tools":"linux-x86_64"}'
-          mac='{"os":"macos-latest","bundles":"dmg","tools":"macos-aarch64"}'
+          mac='{"os":"macos-latest","bundles":"app,dmg","tools":"macos-aarch64"}'
           win='{"os":"windows-latest","bundles":"nsis","tools":"win64"}'
           if [ "${{ inputs.all_platforms }}" = "true" ]; then
             echo "matrix={\"include\":[$linux,$mac,$win]}" >> "$GITHUB_OUTPUT"
@@ -77,7 +77,7 @@ jobs:
       - name: Verify Mac app signature
         if: runner.os == 'macOS'
         run: |
-          app=$(find target/release/bundle/macos -maxdepth 1 -name '*.app' | head -1)
+          app=$(find target/release/bundle -maxdepth 3 -name '*.app' -type d | head -1)
           [ -n "$app" ] || { echo "::error::no .app found in target/release/bundle/macos"; exit 1; }
           if ! out=$(codesign --verify --deep --strict --verbose=2 "$app" 2>&1); then
             echo "$out"
