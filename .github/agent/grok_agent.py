@@ -53,7 +53,7 @@ def gh_api(method, path, body=None):
 
 
 def grok(system, user):
-    body = {"model": MODEL, "temperature": 0.2,
+    body = {"model": MODEL, "temperature": 0.2, "stream": True,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": system},
                          {"role": "user", "content": user}]}
@@ -64,8 +64,10 @@ def grok(system, user):
     text = None
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(req, timeout=1500) as r:
-                text = json.loads(r.read())["choices"][0]["message"]["content"]
+            # Streamed, so data keeps flowing while Grok works and long answers don't
+            # get cut off as idle connections. The timeout is per read, not in total.
+            with urllib.request.urlopen(req, timeout=300) as r:
+                text = read_stream(r)
             break
         except urllib.error.HTTPError as e:
             if e.code not in (429, 500, 502, 503, 504) or attempt == 2:
@@ -78,6 +80,27 @@ def grok(system, user):
         time.sleep(15 * (attempt + 1))
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
     return json.loads(text)
+
+
+def read_stream(response):
+    """Collect the answer from a server-sent-events chat completion stream."""
+    parts, finished = [], False
+    for raw in response:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            finished = True
+            break
+        chunk = json.loads(data)
+        for choice in chunk.get("choices", []):
+            parts.append((choice.get("delta") or {}).get("content") or "")
+            if choice.get("finish_reason"):
+                finished = True
+    if not finished:
+        raise OSError("Grok stream ended early")
+    return "".join(parts)
 
 
 def repo_snapshot():
