@@ -11,11 +11,27 @@ trap 'echo "::error title=Test failed::Step \"$CURRENT\" failed"' ERR
 step "fetch built-in tools"
 python3 scripts/fetch_tools.py linux-x86_64
 
+# Run a command; on failure, turn its error lines into annotations so the cause is visible.
+checked() {
+  set +e
+  local out code
+  out=$("$@" 2>&1)
+  code=$?
+  set -e
+  echo "$out"
+  if [ $code -ne 0 ]; then
+    echo "$out" | grep -E "^(error|warning)(\[|:)|^ *--> |^Diff in " | head -20 | while IFS= read -r l; do
+      echo "::error title=$CURRENT::$l"
+    done
+    return $code
+  fi
+}
+
 step "format"
-cargo fmt --all -- --check
+checked cargo fmt --all -- --check
 
 step "lint"
-cargo clippy --workspace --all-targets -- -D warnings
+checked cargo clippy --workspace --all-targets -- -D warnings
 
 step "unit tests"
 set +e
