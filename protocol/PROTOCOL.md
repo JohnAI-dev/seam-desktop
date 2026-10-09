@@ -48,7 +48,7 @@ Phone → desktop:
 
 | type | fields |
 |---|---|
-| `notification` | `id` (string, unique per notification), `app` (package name), `app_name`, `title`, `text`, `time` (ms since epoch) |
+| `notification` | `id` (string, unique per notification), `app` (package name), `app_name`, `title`, `text`, `time` (ms since epoch), `replyable` (bool, optional, default false: the notification has an inline reply field) |
 | `notification_removed` | `id` |
 | `battery` | `level` (0-100), `charging` (bool) |
 | `pong` | — |
@@ -65,6 +65,53 @@ Both directions:
 | type | fields |
 |---|---|
 | `clipboard` | `text` (at most 100 000 characters) — the sender's clipboard changed or the person chose "send clipboard"; the receiver puts it on its clipboard |
+
+## Replying to notifications
+
+When a `notification` has `replyable: true`, the desktop may send
+`{"type":"reply","id":"<notification id>","text":"<at most 5 000 characters>"}`.
+The phone fills the notification's own inline reply field (Android `RemoteInput`) and
+fires it, then answers `{"type":"reply_result","id":"<id>","ok":true}` or
+`{"type":"reply_result","id":"<id>","ok":false,"error":"<reason>"}` (e.g. the notification
+is gone or has no reply action).
+
+## Sending files
+
+Either side can send a file. Files are at most **2 GiB**; chunks carry at most **256 KiB**
+of raw data (base64 in the frame, well under the 1 MiB line limit).
+
+| type | fields |
+|---|---|
+| `file_offer` | `transfer` (random 32 hex chars), `name` (file name only, no path), `size` (bytes), `mime` (optional) |
+| `file_accept` | `transfer` |
+| `file_reject` | `transfer`, `reason` (optional) |
+| `file_chunk` | `transfer`, `seq` (0, 1, 2, ...), `data` (standard base64) |
+| `file_done` | `transfer`, `sha256` (64 hex chars of the whole file) |
+| `file_result` | `transfer`, `ok` (bool), `error` (optional) |
+| `file_cancel` | `transfer` — either side gives up; the receiver deletes the partial file |
+
+1. Sender: `file_offer`. Receiver answers `file_accept` (it saves to its Downloads folder,
+   by default without asking) or `file_reject`.
+2. After `file_accept`, the sender sends `file_chunk`s in order, then `file_done`.
+3. Receiver writes to a temporary file, checks the size and SHA-256, moves it into place
+   (adding ` (1)`, ` (2)` ... if the name exists), and answers `file_result`.
+
+Receivers must strip any path from `name` (`/`, `\`, `..`, leading dots) and must never
+write outside their download folder. Wrong `seq`, more bytes than `size`, or a wrong hash
+fail the transfer. Other messages (pings, notifications) may be interleaved with chunks.
+
+## Calls
+
+Phone → desktop: `{"type":"call","state":"ringing"|"active"|"ended","number":"<or empty>","name":"<contact name or empty>"}`.
+
+Desktop → phone: `{"type":"call_action","action":"decline"|"silence"}` — `decline` rejects
+the ringing call, `silence` stops the ringtone. Answering happens on the phone.
+
+## Find my phone
+
+Desktop → phone: `{"type":"ring"}` — the phone rings loudly (alarm volume, even when on
+silent or Do Not Disturb) and shows a full-screen "Found it" button, until that button is
+pressed, `{"type":"ring_stop"}` arrives, or 60 seconds pass.
 
 ## Finding the computer after its address changes
 
