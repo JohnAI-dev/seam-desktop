@@ -91,7 +91,7 @@ jobs:
             "$f" --version >/dev/null 2>&1 || "$f" version >/dev/null 2>&1 || { echo "::error::built-in $t does not run on macOS"; exit 1; }
           done
           echo "Mac app is signed and its built-in tools run"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: seam-${{ matrix.os }}
           path: |
