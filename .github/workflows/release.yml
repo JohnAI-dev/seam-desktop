@@ -73,6 +73,8 @@ jobs:
 
   publish:
     needs: build
+    # Publish whatever platforms built, even if one of them failed.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.rel.outputs.url }}
@@ -88,9 +90,16 @@ jobs:
           sha=$(gh api repos/${{ github.repository }}/commits/main --jq .sha)
           tag="build-$(date -u +%Y%m%d-%H%M%S)-${sha:0:7}"
           mapfile -t files < <(find dist -type f)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::No platform built successfully"; exit 1; fi
           printf "  %s\n" "${files[@]}"
           url=$(gh release create "$tag" "${files[@]}" --repo ${{ github.repository }} --target "$sha" \
                 --title "Seam $(date -u +%Y-%m-%d) (${sha:0:7})" \
-                --notes "Automatic build of main at ${sha:0:7}. Install the .deb (Debian/Ubuntu) or run the .AppImage (any Linux, incl. Arch).")
+                --notes "Automatic build of main at ${sha:0:7}.
+
+- **Linux:** run the .AppImage (any distro, incl. Arch) or install the .deb (Debian/Ubuntu).
+- **Mac (Apple Silicon):** open the .dmg and drag Seam to Applications. The app is not signed yet, so the first time: right-click Seam → Open → Open.
+- **Windows:** run the -setup.exe. Windows may warn about an unknown publisher: More info → Run anyway.
+
+Seam needs adb and scrcpy (Arch: pacman -S android-tools scrcpy, Mac: brew install android-platform-tools scrcpy).")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "Released: $url"
