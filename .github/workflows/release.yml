@@ -78,7 +78,12 @@ jobs:
           p = "src-tauri/tauri.conf.json"
           c = json.load(open(p))
           c["version"] = os.environ["VERSION"]
-          c["bundle"]["createUpdaterArtifacts"] = os.environ["HAS_KEY"] == "true"
+          has_key = os.environ["HAS_KEY"] == "true"
+          if c["plugins"]["updater"].get("pubkey") and not has_key:
+              # Installed apps only update from releases with signed update files.
+              raise SystemExit("::error title=Missing updater key::TAURI_SIGNING_PRIVATE_KEY is not "
+                               "available to this run (a workflow_call needs `secrets: inherit`)")
+          c["bundle"]["createUpdaterArtifacts"] = has_key
           json.dump(c, open(p, "w"), indent=2)
           print("version", c["version"], "updater artifacts", c["bundle"]["createUpdaterArtifacts"])
           PY

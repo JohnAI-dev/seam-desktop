@@ -113,6 +113,7 @@ jobs:
   release:
     needs: merge
     uses: ./.github/workflows/release.yml
+    secrets: inherit
 
   close-issue:
     needs: [pick, fix, release]
