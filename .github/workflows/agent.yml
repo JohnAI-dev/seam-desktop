@@ -42,8 +42,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EXPLICIT_ISSUE: ${{ inputs.issue }}
-          # 3 runs per engineer that has a key (Grok, then Claude, then OpenAI).
-          MAX_FAILED_RUNS: ${{ 3 + (secrets.ANTHROPIC_API_KEY != '' && 3 || 0) + (secrets.OPENAI_API_KEY != '' && 3 || 0) }}
+          # 3 runs per engineer: Grok, then (with an OpenRouter key) Claude and OpenAI.
+          MAX_FAILED_RUNS: ${{ secrets.OPENROUTER_API_KEY != '' && 9 || 3 }}
         run: |
           set -euo pipefail
           R=${{ github.repository }}
@@ -109,21 +109,19 @@ jobs:
         # Not via the agent's environment: the code it writes runs as child processes.
         env:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GH_TOKEN: ${{ github.token }}
         run: |
           d="$RUNNER_TEMP/agent-secrets"; mkdir -m 700 "$d"
           printf '%s' "$XAI_API_KEY" > "$d/xai"; printf '%s' "$GH_TOKEN" > "$d/gh"
-          [ -z "$ANTHROPIC_API_KEY" ] || printf '%s' "$ANTHROPIC_API_KEY" > "$d/anthropic"
-          [ -z "$OPENAI_API_KEY" ] || printf '%s' "$OPENAI_API_KEY" > "$d/openai"
+          [ -z "$OPENROUTER_API_KEY" ] || printf '%s' "$OPENROUTER_API_KEY" > "$d/openrouter"
           chmod 600 "$d"/*
           echo "AGENT_SECRETS_DIR=$d" >> "$GITHUB_ENV"
       - name: Grok fixes and reviews
         id: agent
         env:
           XAI_MODEL: ${{ vars.XAI_MODEL }}
-          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
           AGENT_MAX_ATTEMPTS: "8"
         run: python3 .github/agent/grok_agent.py

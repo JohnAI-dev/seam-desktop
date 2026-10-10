@@ -39,7 +39,7 @@ def _load_secrets():
     """Read the tokens from files the workflow wrote, then delete them. They are never in
     this process's environment, so code under test can't read them from /proc either."""
     d = os.environ.get("AGENT_SECRETS_DIR")
-    names = {"xai": "XAI_API_KEY", "gh": "GH_TOKEN", "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+    names = {"xai": "XAI_API_KEY", "gh": "GH_TOKEN", "openrouter": "OPENROUTER_API_KEY"}
     if not d:
         return {k: os.environ.get(v, "") for k, v in names.items()}
     out = {}
@@ -56,11 +56,13 @@ _KEYS = _load_secrets()
 XAI_KEY, GH_TOKEN = _KEYS["xai"], _KEYS["gh"]
 
 # Engineers, in escalation order: Grok first; if it fails 3 runs in a row on an issue,
-# Claude takes over; after 3 more, OpenAI. A provider without an API key is skipped.
+# Claude takes over for 3 runs, then OpenAI. Claude and OpenAI go through OpenRouter (one key,
+# OPENROUTER_API_KEY); without it they are skipped. Each entry: (provider, name, model or a
+# pattern that picks the newest matching model from OpenRouter's catalogue).
 ENGINEERS = [
     ("xai", "Grok", os.environ.get("XAI_MODEL") or "grok-4.7"),
-    ("anthropic", "Claude", os.environ.get("ANTHROPIC_MODEL") or "claude-opus-5-5"),
-    ("openai", "OpenAI", os.environ.get("OPENAI_MODEL") or "gpt-5"),
+    ("openrouter", "Claude", os.environ.get("CLAUDE_MODEL") or r"^anthropic/claude-opus-[0-9.]+$"),
+    ("openrouter", "OpenAI", os.environ.get("OPENAI_MODEL") or r"^openai/gpt-[0-9]+(\.[0-9]+)?$"),
 ]
 RUNS_PER_ENGINEER = 3
 
@@ -89,32 +91,44 @@ def gh_api(method, path, body=None):
         return json.loads(r.read() or b"{}")
 
 
-def llm(provider, system, user):
+_newest = {}
+
+
+def resolve_model(model):
+    """A fixed model id is used as is; a pattern (starting with ^) picks the newest matching
+    model in OpenRouter's public catalogue, so new Claude/GPT versions are used automatically."""
+    if not model.startswith("^"):
+        return model
+    if model not in _newest:
+        with urllib.request.urlopen("https://openrouter.ai/api/v1/models", timeout=60) as r:
+            models = json.load(r)["data"]
+        matches = [m for m in models if re.match(model, m["id"])]
+        if not matches:
+            raise RuntimeError(f"no OpenRouter model matches {model}")
+        _newest[model] = max(matches, key=lambda m: m.get("created", 0))["id"]
+    return _newest[model]
+
+
+def llm(provider, system, user, model=None):
     """One JSON answer from a model. Streamed, so long answers aren't cut off as idle
     connections; the timeout is per read, not in total."""
-    model = next(m for p, _, m in ENGINEERS if p == provider)
-    if provider == "anthropic":
-        url = os.environ.get("ANTHROPIC_API_URL", "https://api.anthropic.com/v1/messages")
-        body = {"model": model, "max_tokens": 32000, "stream": True, "system": system,
-                "messages": [{"role": "user", "content": user}]}
-        headers = {"x-api-key": _KEYS["anthropic"], "anthropic-version": "2023-06-01",
-                   "Content-Type": "application/json"}
-        reader = read_anthropic_stream
+    model = resolve_model(model or ENGINEERS[0][2])
+    if provider == "openrouter":
+        url = os.environ.get("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+        extra = {"HTTP-Referer": f"https://github.com/{REPO}", "X-Title": "Seam agent"}
     else:
-        url = (os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
-               if provider == "openai" else API_URL)
-        body = {"model": model, "stream": True, "response_format": {"type": "json_object"},
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
-        if provider == "xai":
-            body["temperature"] = 0.2
-        headers = {"Authorization": f"Bearer {_KEYS[provider]}", "Content-Type": "application/json"}
-        reader = read_stream
+        url, extra = API_URL, {}
+    body = {"model": model, "stream": True, "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if provider == "xai":
+        body["temperature"] = 0.2
+    headers = {"Authorization": f"Bearer {_KEYS[provider]}", "Content-Type": "application/json", **extra}
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
     text = None
     for attempt in range(3):
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
-                text = reader(r)
+                text = read_stream(r)
             break
         except urllib.error.HTTPError as e:
             if e.code not in (429, 500, 502, 503, 504, 529) or attempt == 2:
@@ -151,26 +165,6 @@ def read_stream(response):
             parts.append((choice.get("delta") or {}).get("content") or "")
             if choice.get("finish_reason"):
                 finished = True
-    if not finished:
-        raise OSError("stream ended early")
-    return "".join(parts)
-
-
-def read_anthropic_stream(response):
-    """Collect the text from an Anthropic Messages API stream."""
-    parts, finished = [], False
-    for raw in response:
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data:"):
-            continue
-        event = json.loads(line[5:].strip())
-        kind = event.get("type")
-        if kind == "content_block_delta" and (event.get("delta") or {}).get("type") == "text_delta":
-            parts.append(event["delta"].get("text", ""))
-        elif kind == "message_stop":
-            finished = True
-        elif kind == "error":
-            raise OSError(f"Anthropic stream error: {event.get('error')}")
     if not finished:
         raise OSError("stream ended early")
     return "".join(parts)
@@ -315,6 +309,7 @@ def main():
 
     feedback, summary, review = previous_failure(num), "", {}
     engineer = choose_engineer(num)
+    engineer = (engineer[0], engineer[1], resolve_model(engineer[2]))
     print(f"engineer: {engineer[1]} ({engineer[2]})", flush=True)
     # Continue from the last failed run's work if it was saved, instead of starting over.
     keep = False
@@ -339,7 +334,7 @@ def main():
             prompt += f"\n\n--- YOUR PREVIOUS ATTEMPT WAS REJECTED ---\n{feedback}"
         keep = False
         try:
-            plan = llm(engineer[0], ENGINEER, prompt)
+            plan = llm(engineer[0], ENGINEER, prompt, engineer[2])
             summary = plan.get("summary", "")
             touched = apply_changes(plan.get("changes", []))
         except urllib.error.HTTPError as e:
