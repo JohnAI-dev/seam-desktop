@@ -12,6 +12,7 @@ Safety rails:
   - Paths under PROTECTED (pipeline, agent, test harness) can never be changed by the agent.
   - Tests run with a scrubbed environment, so code the agent writes can't read API keys.
 """
+import base64
 import json
 import os
 import re
@@ -34,6 +35,30 @@ MAX_CONTEXT_BYTES = 400_000
 REPO = os.environ["GITHUB_REPOSITORY"]
 
 
+def _load_secrets():
+    """Read the tokens from files the workflow wrote, then delete them. They are never in
+    this process's environment, so code under test can't read them from /proc either."""
+    d = os.environ.get("AGENT_SECRETS_DIR")
+    if not d:
+        return os.environ.get("XAI_API_KEY", ""), os.environ.get("GH_TOKEN", "")
+    out = []
+    for name in ("xai", "gh"):
+        f = Path(d, name)
+        out.append(f.read_text().strip())
+        f.unlink()
+    Path(d).rmdir()
+    return tuple(out)
+
+
+XAI_KEY, GH_TOKEN = _load_secrets()
+
+
+def git_auth():
+    """Credentials for one git command (checkout doesn't persist any)."""
+    basic = base64.b64encode(f"x-access-token:{GH_TOKEN}".encode()).decode()
+    return ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"]
+
+
 def sh(*cmd, check=True, env=None):
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if check and r.returncode != 0:
@@ -45,7 +70,7 @@ def gh_api(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         f"{GH_API}/{path}", data=data, method=method,
-        headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+        headers={"Authorization": f"Bearer {GH_TOKEN}",
                  "Accept": "application/vnd.github+json",
                  "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -59,7 +84,7 @@ def grok(system, user):
                          {"role": "user", "content": user}]}
     req = urllib.request.Request(
         API_URL, data=json.dumps(body).encode(), method="POST",
-        headers={"Authorization": f"Bearer {os.environ['XAI_API_KEY']}",
+        headers={"Authorization": f"Bearer {XAI_KEY}",
                  "Content-Type": "application/json"})
     text = None
     for attempt in range(3):
@@ -295,8 +320,8 @@ def main():
         sys.exit(1)
     # Replace the remote branch rather than force-push over it: GitHub treats the main commits
     # between the old and new base as workflow changes made by this app, and refuses them.
-    sh("git", "push", "-q", "origin", "--delete", branch, check=False)
-    sh("git", "push", "origin", branch)
+    sh("git", *git_auth(), "push", "-q", "origin", "--delete", branch, check=False)
+    sh("git", *git_auth(), "push", "origin", branch)
     owner = REPO.split("/")[0]
     existing = gh_api("GET", f"repos/{REPO}/pulls?state=open&head={owner}:{branch}")
     if existing:
