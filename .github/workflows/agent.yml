@@ -66,7 +66,12 @@ jobs:
             case "$body" in
               "🤖 Grok agent could not"*|"🤖 Grok agent crashed"*|"🤖 xAI rejected"*|*"leaving it for a human"*|"🤖 Grok agent ran out of time"*)
                 labeled=$(gh api "repos/$R/issues/$n/events?per_page=100" --jq '[.[] | select(.event == "labeled" and .label.name == "agent")] | last | .created_at // ""')
-                [[ "$labeled" > "$at" ]] || continue ;;
+                if [[ ! "$labeled" > "$at" ]]; then
+                  # Grok gave up after all attempts: continue automatically (from the saved attempt)
+                  # until it has failed 3 runs in a row since the label was last added.
+                  fails=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq "[.[] | select(.created_at > \"$labeled\") | select(.body | startswith(\"🤖 Grok agent could not produce\"))] | length")
+                  case "$body" in "🤖 Grok agent could not produce"*) [ "$fails" -lt 3 ] || continue ;; *) continue ;; esac
+                fi ;;
             esac
             echo "issue=$n" >> "$GITHUB_OUTPUT"; echo "picked #$n"; exit 0
           done
@@ -111,7 +116,7 @@ jobs:
         id: agent
         env:
           XAI_MODEL: ${{ vars.XAI_MODEL }}
-          AGENT_MAX_ATTEMPTS: "5"
+          AGENT_MAX_ATTEMPTS: "8"
         run: python3 .github/agent/grok_agent.py
 
   test:
