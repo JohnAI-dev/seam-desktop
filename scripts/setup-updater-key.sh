@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time: create the key that signs Seam desktop updates, and wire it up everywhere.
-# Run on prod1 (needs GIT_TOKEN with repo access):
+# Run on the machine that holds the signing setup (needs GIT_TOKEN with repo access):
 #   curl -fsSL https://raw.githubusercontent.com/JohnAI-dev/seam-desktop/main/scripts/setup-updater-key.sh | bash
 #
 # - private key  -> GitHub secret TAURI_SIGNING_PRIVATE_KEY (only the release build can use it)
@@ -9,7 +9,7 @@
 set -euo pipefail
 REPO=JohnAI-dev/seam-desktop
 KEY="$HOME/seam-updater.key"
-BACKUP_DIR=/run/media/john/coldbackup
+BACKUP_DIR="${BACKUP_DIR:-}"   # optional: an offline backup disk to copy the key to
 export GH_TOKEN="${GIT_TOKEN:?GIT_TOKEN must be set}"
 
 command -v npx >/dev/null || sudo pacman -S --needed --noconfirm nodejs npm
@@ -24,12 +24,12 @@ chmod 600 "$KEY"
 echo "== storing it as a GitHub secret"
 gh secret set TAURI_SIGNING_PRIVATE_KEY -R "$REPO" < "$KEY"
 
-if [ -d "$BACKUP_DIR" ]; then
+if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
   install -m 600 "$KEY" "$BACKUP_DIR/seam-updater.key"
   install -m 644 "$KEY.pub" "$BACKUP_DIR/seam-updater.key.pub"
   echo "== backed up to $BACKUP_DIR"
 else
-  echo "!! $BACKUP_DIR is not mounted: copy $KEY somewhere safe yourself"
+  echo "!! no BACKUP_DIR: copy $KEY somewhere safe yourself before it is deleted"
 fi
 
 echo "== putting the public key into the app"
