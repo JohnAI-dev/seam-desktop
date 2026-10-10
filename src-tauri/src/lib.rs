@@ -2,6 +2,7 @@
 
 mod link;
 mod updates;
+mod wireless;
 
 use seam_core::{adb, scrcpy, tools, tools::Tool};
 use serde::Serialize;
@@ -186,6 +187,23 @@ async fn handle_file_drop(app: AppHandle, paths: Vec<String>) -> Result<link::Dr
     app.state::<link::Link>().deliver_drop(&paths)
 }
 
+#[tauri::command]
+fn wireless_status(wireless: State<wireless::Wireless>) -> wireless::WirelessStatus {
+    wireless.status()
+}
+
+#[tauri::command]
+fn start_wireless_pairing(
+    wireless: State<wireless::Wireless>,
+) -> Result<wireless::WirelessPairingView, String> {
+    wireless.start_pairing()
+}
+
+#[tauri::command]
+fn cancel_wireless_pairing(wireless: State<wireless::Wireless>) {
+    wireless.cancel();
+}
+
 /// Called by the UI once it has rendered. In self-test mode this ends the app with
 /// a pass/fail exit code, so CI can prove the real window starts and works.
 #[tauri::command]
@@ -239,6 +257,7 @@ pub fn run() {
             use_bundled_tools(app.handle());
             app.manage(link::start(app.handle(), !self_test));
             link::watch_drops(app.handle());
+            app.manage(wireless::start(app.handle()));
             if !self_test {
                 updates::start(app.handle());
             }
@@ -262,6 +281,9 @@ pub fn run() {
             handle_file_drop,
             update_status,
             restart_to_update,
+            wireless_status,
+            start_wireless_pairing,
+            cancel_wireless_pairing,
             frontend_ready
         ])
         .run(tauri::generate_context!())

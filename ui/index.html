@@ -67,6 +67,27 @@
       <p id="received-empty" class="hint">Files your phone sends show up here.</p>
     </section>
 
+    <section aria-labelledby="wireless-h">
+      <div class="section-head">
+        <h2 id="wireless-h">Mirror without cable</h2>
+        <button id="wireless-btn" class="secondary" type="button">Pair with QR code</button>
+      </div>
+      <p class="hint">Android 11 or newer, on the same Wi-Fi as this computer. No USB cable.</p>
+      <ol id="wireless-steps" class="steps">
+        <li>Enable <strong>Developer options</strong> once (Settings → About phone → tap Build number seven times).</li>
+        <li>Open <strong>Wireless debugging</strong>.</li>
+        <li>Tap <strong>Pair device with QR code</strong> and scan the code.</li>
+      </ol>
+      <div id="wireless" class="pairing" hidden>
+        <div id="wireless-qr" class="qr" aria-label="Wireless debugging QR code"></div>
+        <p id="wireless-status" class="hint">Waiting for the phone to scan the QR code...</p>
+        <p class="hint">The code expires in <span id="wireless-expiry">2</span> minutes.</p>
+        <button id="wireless-cancel" class="secondary" type="button">Cancel</button>
+      </div>
+      <p id="wireless-confirm" class="confirm" role="status" hidden></p>
+      <p id="wireless-error" class="error" hidden></p>
+    </section>
+
     <section aria-labelledby="phones-h">
       <h2 id="phones-h">USB / debugging connection</h2>
       <ul id="devices" aria-live="polite"></ul>
