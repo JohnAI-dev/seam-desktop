@@ -196,8 +196,9 @@ def previous_failure(num):
         return ""
     for c in reversed(comments or []):
         body = c.get("body") or ""
-        if body.startswith("🤖 Grok agent could not produce") and "Reviewer rejected it" in body:
-            return "A previous run on this issue was rejected. Address this feedback:\n" + body[:3000]
+        if body.startswith("🤖 Grok agent could not produce"):
+            return ("A previous run on this issue failed. Fix every point in this feedback, and check "
+                    "concurrency, edge cases and tests before answering:\n" + body[:6000])
     return ""
 
 

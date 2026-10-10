@@ -55,6 +55,12 @@ jobs:
           # label was (re-)added after that failure.
           for n in $(gh api "repos/$R/issues?state=open&labels=agent&sort=created&direction=asc&per_page=50" \
                        --jq '.[] | select(.pull_request == null) | select([.labels[].name] | index("no-agent") | not) | .number'); do
+            # "Depends on #N" in the issue: wait until #N is closed.
+            blocked=""
+            for d in $(gh api repos/$R/issues/$n --jq '.body // ""' | grep -oiE 'depends on #[0-9]+' | grep -oE '[0-9]+' || true); do
+              [ "$(gh api repos/$R/issues/$d --jq .state)" = open ] && blocked="#$d"
+            done
+            if [ -n "$blocked" ]; then echo "#$n waits for $blocked"; continue; fi
             last=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq '[.[] | select(.body | startswith("🤖"))] | last // {} | "\(.created_at // "")|\(.body // "")"')
             at=${last%%|*}; body=${last#*|}
             case "$body" in
@@ -70,7 +76,7 @@ jobs:
     needs: pick
     if: needs.pick.outputs.issue != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 210
     outputs:
       branch: ${{ steps.agent.outputs.branch }}
       pr: ${{ steps.agent.outputs.pr }}
@@ -97,6 +103,7 @@ jobs:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
           XAI_MODEL: ${{ vars.XAI_MODEL }}
           GH_TOKEN: ${{ github.token }}
+          AGENT_MAX_ATTEMPTS: "5"
         run: python3 .github/agent/grok_agent.py
 
   test:
