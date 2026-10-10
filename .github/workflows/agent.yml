@@ -15,7 +15,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  actions: read
+  actions: write
 concurrency:
   group: agent-issue-${{ github.event.issue.number || inputs.issue }}
   cancel-in-progress: false

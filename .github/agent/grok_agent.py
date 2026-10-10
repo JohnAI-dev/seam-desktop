@@ -269,13 +269,26 @@ def main():
        "commit", "-q", "-m", f"Fix #{num}: {title}\n\n{summary}")
     # main may have moved while we worked (other merges, pipeline updates). Put this
     # change on top of the latest main so the PR contains only our change; CI re-tests it.
+    # Build and test leftovers must not block the rebase; the change itself is committed.
+    sh("git", "reset", "--hard", "-q")
+    sh("git", "clean", "-fdq")
     sh("git", "fetch", "-q", "origin", "main")
     rebase = sh("git", "rebase", "origin/main", check=False)
     if rebase.returncode != 0:
         sh("git", "rebase", "--abort", check=False)
+        why = (rebase.stdout + rebase.stderr)[-1500:]
+        print(f"::warning title=Rebase failed::{why[-300:]}", flush=True)
+        earlier = [c for c in (gh_api("GET", f"repos/{REPO}/issues/{num}/comments?per_page=100") or [])
+                   if (c.get("body") or "").startswith("🤖 The change conflicts")]
+        if len(earlier) < 2:
+            # Start over on top of the latest main, automatically (at most twice per issue).
+            gh_api("POST", f"repos/{REPO}/actions/workflows/agent.yml/dispatches",
+                   {"ref": "main", "inputs": {"issue": str(num)}})
+            note = "Starting again on top of the latest code automatically."
+        else:
+            note = "This keeps happening; leaving it for a human."
         gh_api("POST", f"repos/{REPO}/issues/{num}/comments", {"body":
-               "🤖 The change conflicts with newer changes on main. Re-run the agent "
-               "(remove and re-add the `agent` label) to redo it on top of the latest code."})
+               f"🤖 The change conflicts with newer changes on main. {note}\n```\n{why}\n```"})
         sys.exit(1)
     # Replace the remote branch rather than force-push over it: GitHub treats the main commits
     # between the old and new base as workflow changes made by this app, and refuses them.
