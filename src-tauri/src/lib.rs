@@ -7,6 +7,7 @@ use seam_core::{adb, scrcpy, tools, tools::Tool};
 use serde::Serialize;
 use std::time::Duration;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 /// Whether the app was started with `--self-test` (launch, render, report, exit).
 struct SelfTest(bool);
@@ -140,6 +141,51 @@ fn restart_to_update(app: AppHandle) -> Result<(), String> {
     updates::install_and_restart(&app)
 }
 
+/// Open the system file picker. `None` means the person cancelled.
+#[tauri::command]
+async fn pick_file(app: AppHandle) -> Result<Option<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Send file")
+        .pick_file(move |file| {
+            let result = match file {
+                None => Ok(None),
+                Some(file) => file
+                    .into_path()
+                    .map(|path| Some(path.display().to_string()))
+                    .map_err(|e| format!("could not use that file: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+    rx.await.map_err(|_| "file picker failed".to_string())?
+}
+
+/// Async so the phone link can spawn the transfer on the running runtime.
+#[tauri::command]
+async fn send_file(app: AppHandle, phone: String, path: String) -> Result<String, String> {
+    app.state::<link::Link>().send_file(&phone, &path)
+}
+
+#[tauri::command]
+fn cancel_file_send(phone_link: State<link::Link>, transfer: String) -> Result<(), String> {
+    phone_link.cancel_send(&transfer)
+}
+
+/// Reveal runs off the main thread so a slow file manager cannot freeze the window.
+#[tauri::command]
+async fn reveal_file(app: AppHandle, path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<link::Link>().reveal_received(&path))
+        .await
+        .map_err(|_| "could not show the file".to_string())?
+}
+
+/// Send dropped files to the only connected phone, or ask the window which one.
+#[tauri::command]
+async fn handle_file_drop(app: AppHandle, paths: Vec<String>) -> Result<link::DropPlan, String> {
+    app.state::<link::Link>().deliver_drop(&paths)
+}
+
 /// Called by the UI once it has rendered. In self-test mode this ends the app with
 /// a pass/fail exit code, so CI can prove the real window starts and works.
 #[tauri::command]
@@ -185,12 +231,14 @@ pub fn run() {
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(updates::Updates::default())
         .manage(SelfTest(self_test))
         .setup(move |app| {
             use_bundled_tools(app.handle());
             app.manage(link::start(app.handle(), !self_test));
+            link::watch_drops(app.handle());
             if !self_test {
                 updates::start(app.handle());
             }
@@ -207,6 +255,11 @@ pub fn run() {
             call_action,
             ring_phone,
             send_clipboard,
+            pick_file,
+            send_file,
+            cancel_file_send,
+            reveal_file,
+            handle_file_drop,
             update_status,
             restart_to_update,
             frontend_ready

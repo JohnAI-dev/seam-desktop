@@ -99,3 +99,18 @@ button.link { background: transparent; color: var(--muted); padding: 4px 8px; fo
 .call-banner .call-caller { font-weight: 600; overflow-wrap: anywhere; }
 .call-banner .call-actions { display: flex; gap: 8px; flex: none; }
 .call-banner button.decline { background: var(--bad); color: var(--accent-fg); }
+.files { margin-top: 8px; }
+.file-row {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px; margin-bottom: 6px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+}
+.file-row .info { flex: 1; min-width: 0; }
+.file-row .name { font-weight: 600; overflow-wrap: anywhere; }
+.file-row .meta { color: var(--muted); font-size: 13px; }
+.file-row .fail { color: var(--bad); }
+.drop-ask {
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: 14px; margin-bottom: 12px;
+}
+.drop-ask p { margin: 0 0 8px; }
+.drop-ask-phones { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }

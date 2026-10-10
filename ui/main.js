@@ -216,6 +216,211 @@ function listenForIncomingCalls() {
   }
 }
 
+function phoneLabel(link, id) {
+  const phones = link.phones || [];
+  for (let i = 0; i < phones.length; i++) {
+    if (phones[i].id === id && phones[i].name) return phones[i].name;
+  }
+  return id || "";
+}
+
+function sendStatusText(send) {
+  if (send.state === "done") return "Sent";
+  if (send.state === "failed") return send.error || "could not send the file";
+  const size = Number(send.size) || 0;
+  const sent = Number(send.sent) || 0;
+  if (size <= 0) return "Sending\u2026";
+  const pct = Math.min(100, Math.round((sent / size) * 100));
+  return "Sending " + pct + "%";
+}
+
+function fileSendRow(link, send) {
+  const who = phoneLabel(link, send.phone);
+  let meta = sendStatusText(send);
+  if (who) meta += " \u00b7 " + who;
+  const info = el(
+    "div",
+    { className: "info" },
+    el("div", { className: "name", textContent: send.name || "file" }),
+    el("div", { className: send.state === "failed" ? "meta fail" : "meta", textContent: meta }),
+  );
+  const row = el("li", { className: "file-row" }, info);
+  if (send.state === "sending" && send.transfer) {
+    const cancel = el("button", { type: "button", className: "secondary", textContent: "Cancel" });
+    cancel.addEventListener("click", async () => {
+      cancel.disabled = true;
+      try {
+        await invoke("cancel_file_send", { transfer: send.transfer });
+        showLinkError(null);
+        await refreshLink();
+      } catch (e) {
+        const msg = String(e);
+        if (msg.indexOf("not running") === -1) showLinkError(msg);
+        await refreshLink().catch(() => {});
+        cancel.disabled = false;
+      }
+    });
+    row.append(cancel);
+  }
+  return row;
+}
+
+function receivedRow(file) {
+  const show = el("button", {
+    type: "button",
+    className: "secondary",
+    textContent: "Show in folder",
+  });
+  show.addEventListener("click", async () => {
+    show.disabled = true;
+    try {
+      await invoke("reveal_file", { path: file.path });
+      showLinkError(null);
+    } catch (e) {
+      showLinkError(String(e));
+    } finally {
+      show.disabled = false;
+    }
+  });
+  const from = file.phone_name ? "from " + file.phone_name : "";
+  return el(
+    "li",
+    { className: "file-row" },
+    el(
+      "div",
+      { className: "info" },
+      el("div", { className: "name", textContent: file.name || "file" }),
+      from ? el("div", { className: "meta", textContent: from }) : "",
+    ),
+    show,
+  );
+}
+
+function renderFiles(link) {
+  const sendsHead = document.getElementById("sends-h");
+  const sends = document.getElementById("sends");
+  const received = document.getElementById("received");
+  const empty = document.getElementById("received-empty");
+  const outgoing = link.sends || [];
+  if (sendsHead) sendsHead.hidden = outgoing.length === 0;
+  if (sends) sends.replaceChildren(...outgoing.map((send) => fileSendRow(link, send)));
+  const files = link.received || [];
+  if (received) received.replaceChildren(...files.map((file) => receivedRow(file)));
+  if (empty) empty.hidden = files.length > 0;
+}
+
+let dropAskPaths = null;
+
+function hideDropAsk() {
+  dropAskPaths = null;
+  const box = document.getElementById("drop-ask");
+  if (box) box.hidden = true;
+}
+
+async function sendPathsTo(phoneId, phoneName, paths) {
+  let started = 0;
+  let firstError = "";
+  for (let i = 0; i < paths.length; i++) {
+    try {
+      await invoke("send_file", { phone: phoneId, path: paths[i] });
+      started += 1;
+    } catch (e) {
+      if (!firstError) firstError = String(e);
+    }
+  }
+  await refreshLink().catch((e) => {
+    if (!firstError) firstError = String(e);
+  });
+  if (started) showLinkConfirm("Sending to " + (phoneName || "phone") + ".");
+  else showLinkConfirm(null);
+  if (firstError) showLinkError(firstError);
+  else if (started) showLinkError(null);
+}
+
+function showDropAsk(phones, paths) {
+  dropAskPaths = paths;
+  const box = document.getElementById("drop-ask");
+  const list = document.getElementById("drop-ask-phones");
+  const text = document.getElementById("drop-ask-text");
+  if (!box || !list) {
+    showLinkError("no phone is connected");
+    return;
+  }
+  if (text) {
+    text.textContent = paths.length === 1
+      ? "Send this file to which phone?"
+      : "Send these files to which phone?";
+  }
+  list.replaceChildren(
+    ...phones.map((p) => {
+      const btn = el("button", {
+        type: "button",
+        className: "secondary",
+        textContent: p.name || p.id,
+      });
+      btn.addEventListener("click", async () => {
+        const chosen = dropAskPaths || paths;
+        hideDropAsk();
+        await sendPathsTo(p.id, p.name || p.id, chosen);
+      });
+      return btn;
+    }),
+  );
+  box.hidden = false;
+}
+
+async function chooseAndSendFile(phoneId, phoneName) {
+  let path;
+  try {
+    path = await invoke("pick_file");
+  } catch (e) {
+    showLinkError(String(e));
+    return;
+  }
+  if (!path) return;
+  await sendPathsTo(phoneId, phoneName, [path]);
+}
+
+async function onFilesDropped(payload) {
+  const paths = Array.isArray(payload) ? payload.filter((p) => typeof p === "string" && p) : [];
+  if (!paths.length) return;
+  try {
+    const plan = await invoke("handle_file_drop", { paths });
+    if (!plan || plan.action === "error") {
+      await refreshLink().catch(() => {});
+      showLinkError((plan && plan.message) || "could not send the file");
+      return;
+    }
+    if (plan.action === "ask") {
+      showDropAsk(plan.phones || [], plan.paths || paths);
+      return;
+    }
+    await refreshLink().catch(() => {});
+    if (plan.action === "sent") {
+      showLinkError(null);
+      showLinkConfirm("Sending to " + (plan.phone || "phone") + ".");
+    }
+  } catch (e) {
+    await refreshLink().catch(() => {});
+    showLinkError(String(e));
+  }
+}
+
+function listenForFileTransfers() {
+  try {
+    const listen = window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+    if (typeof listen !== "function") return;
+    listen("file-transfer", () => {
+      refreshLink().catch((e) => showLinkError(String(e)));
+    }).catch(() => {});
+    listen("files-dropped", (event) => {
+      onFilesDropped(event && event.payload);
+    }).catch(() => {});
+  } catch (e) {
+    // Self-test still has to render if the event API is missing.
+  }
+}
+
 function openReply(phone, id) {
   const state = noteReplyState(phone, id);
   clearTimeout(state.sentTimer);
@@ -412,6 +617,19 @@ function renderLink(link) {
       });
       const buttons = [];
       if (p.connected) {
+        const sendFile = el("button", {
+          type: "button",
+          className: "secondary",
+          textContent: "Send file\u2026",
+        });
+        sendFile.addEventListener("click", async () => {
+          sendFile.disabled = true;
+          try {
+            await chooseAndSendFile(p.id, p.name);
+          } finally {
+            sendFile.disabled = false;
+          }
+        });
         const ringing = isRinging(p.id);
         const ring = el("button", {
           type: "button",
@@ -452,7 +670,7 @@ function renderLink(link) {
             send.disabled = false;
           }
         });
-        buttons.push(ring, send);
+        buttons.push(sendFile, ring, send);
       }
       buttons.push(forget);
       return el(
@@ -515,6 +733,7 @@ function renderLink(link) {
   );
   restoreReplyFocus(focusedReply);
   document.getElementById("notif-empty").hidden = link.notifications.length > 0;
+  renderFiles(link);
   showLinkError(link.error);
   if (link.error) showLinkConfirm(null);
 }
@@ -557,6 +776,8 @@ document.getElementById("pair-btn").addEventListener("click", async () => {
   }
 });
 document.getElementById("pair-done").addEventListener("click", hidePairing);
+const dropAskCancel = document.getElementById("drop-ask-cancel");
+if (dropAskCancel) dropAskCancel.addEventListener("click", hideDropAsk);
 
 async function sendCallAction(action) {
   const box = document.getElementById("call");
@@ -644,6 +865,7 @@ async function waitForLink() {
   try {
     listenForReplyResults();
     listenForIncomingCalls();
+    listenForFileTransfers();
     const status = await refresh();
     const link = await waitForLink();
     const rendered = document.querySelectorAll("#tools li").length === 2 && !!document.getElementById("pair-btn");

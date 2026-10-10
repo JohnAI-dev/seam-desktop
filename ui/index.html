@@ -52,6 +52,21 @@
       <p id="notif-empty" class="hint">Notifications from your phone show up here and on your desktop.</p>
     </section>
 
+    <section aria-labelledby="files-h">
+      <h2 id="files-h">Files</h2>
+      <p class="hint">Drop a file on this window to send it to a connected phone.</p>
+      <div id="drop-ask" class="drop-ask" hidden>
+        <p id="drop-ask-text">Send this file to which phone?</p>
+        <div id="drop-ask-phones" class="drop-ask-phones"></div>
+        <button id="drop-ask-cancel" class="secondary" type="button">Cancel</button>
+      </div>
+      <h2 id="sends-h" hidden>Sending</h2>
+      <ul id="sends" class="files" aria-live="polite"></ul>
+      <h2 id="received-h">Received files</h2>
+      <ul id="received" class="files" aria-live="polite"></ul>
+      <p id="received-empty" class="hint">Files your phone sends show up here.</p>
+    </section>
+
     <section aria-labelledby="phones-h">
       <h2 id="phones-h">USB / debugging connection</h2>
       <ul id="devices" aria-live="polite"></ul>
