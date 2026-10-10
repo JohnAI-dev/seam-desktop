@@ -113,6 +113,47 @@ Desktop → phone: `{"type":"ring"}` — the phone rings loudly (alarm volume, e
 silent or Do Not Disturb) and shows a full-screen "Found it" button, until that button is
 pressed, `{"type":"ring_stop"}` arrives, or 60 seconds pass.
 
+## App icons
+
+Phone → desktop: `{"type":"app_icon","app":"<package name>","png":"<standard base64>"}` — a
+square PNG of the app's icon, at most 96×96 px and 16 KiB. The phone sends it once per app per
+connection, before the first `notification` from that app. The desktop caches icons by `app`.
+
+## Media
+
+Phone → desktop, whenever the active media session changes (at most once per second):
+
+`{"type":"media","app":"<package>","app_name":"…","title":"…","artist":"…","album":"…","playing":true|false,"position_ms":0,"duration_ms":0,"art":"<optional base64 JPEG, at most 64 KiB>"}`
+
+`{"type":"media_stopped"}` — nothing is playing any more.
+
+Desktop → phone: `{"type":"media_control","action":"play"|"pause"|"toggle"|"next"|"previous"|"volume_up"|"volume_down"}`.
+Unknown actions are ignored.
+
+## Opening links
+
+Either side: `{"type":"open_url","url":"<http(s) URL, at most 4 096 characters>"}`. The receiver
+never opens it by itself: it shows a notification ("Open link from <device>?") and opens the URL
+in the default browser only when the person clicks it. Anything that isn't `http://` or
+`https://` is ignored.
+
+## Recent photos
+
+Phone → desktop: `{"type":"photo_new","id":"<string>","name":"<file name>","taken":<ms since epoch>,"thumb":"<base64 JPEG, at most 32 KiB, longest side 256 px>"}`
+— a new photo or screenshot was saved on the phone. On connect the phone sends the 12 most
+recent ones, oldest first.
+
+Desktop → phone: `{"type":"photo_request","id":"<id>"}` — the phone sends that photo with the
+normal file transfer (`file_offer` …), using the photo's file name.
+
+## Do Not Disturb
+
+Phone → desktop: `{"type":"dnd","on":true|false}` — sent on connect and whenever the phone's
+Do Not Disturb changes.
+
+Desktop → phone: `{"type":"dnd_set","on":true|false}` — turn the phone's Do Not Disturb on or
+off (the phone needs the person's permission once; without it the request is ignored).
+
 ## Finding the computer after its address changes
 
 The desktop advertises itself on the local network with mDNS/DNS-SD:
