@@ -21,3 +21,6 @@ mdns-sd = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.10"

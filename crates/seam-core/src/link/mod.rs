@@ -1,12 +1,14 @@
 //! The secure phone link: lets the Seam phone app talk to this computer over Wi-Fi,
 //! without USB debugging, and advertises the computer on the local network so a
-//! paired phone can find it after an IP change. Protocol: `protocol/PROTOCOL.md`.
+//! paired phone can find it after an IP change. Received files are saved in the
+//! download folder. Protocol: `protocol/PROTOCOL.md`.
 
 pub mod client;
 pub mod mdns;
 pub mod protocol;
 pub mod server;
 pub mod store;
+pub mod transfer;
 
 pub use protocol::{Message, PairingInfo, PhoneNotification};
 pub use server::{local_ip, LinkEvent, LinkServer};
