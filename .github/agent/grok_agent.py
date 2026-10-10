@@ -239,6 +239,9 @@ def review_change(issue_text, diff, test_out):
 
 
 def main():
+    # Every git command that writes commits (commit, rebase, cherry-pick) needs an identity.
+    os.environ.update(GIT_AUTHOR_NAME="grok-agent", GIT_AUTHOR_EMAIL="grok-agent@users.noreply.github.com",
+                      GIT_COMMITTER_NAME="grok-agent", GIT_COMMITTER_EMAIL="grok-agent@users.noreply.github.com")
     event = json.loads(Path(os.environ.get("AGENT_EVENT_PATH") or os.environ["GITHUB_EVENT_PATH"]).read_text())
     issue = event["issue"]
     num, title, body = issue["number"], issue["title"], issue.get("body") or ""
@@ -332,6 +335,9 @@ def main():
     if rebase.returncode != 0:
         sh("git", "rebase", "--abort", check=False)
         why = (rebase.stdout + rebase.stderr)[-1500:]
+        if "CONFLICT" not in why:
+            # Not a merge conflict: a real error. Fail loudly (crash report) instead of restarting.
+            raise RuntimeError(f"git rebase failed:\n{why}")
         print(f"::warning title=Rebase failed::{why[-300:]}", flush=True)
         earlier = [c for c in (gh_api("GET", f"repos/{REPO}/issues/{num}/comments?per_page=100") or [])
                    if (c.get("body") or "").startswith("🤖 The change conflicts")]
