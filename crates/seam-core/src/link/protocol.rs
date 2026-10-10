@@ -133,6 +133,47 @@ pub enum Message {
     CallAction {
         action: CallActionKind,
     },
+    /// Either direction: offer a file. `transfer` is 32 hex chars; `size` is at most 2 GiB.
+    FileOffer {
+        transfer: String,
+        name: String,
+        size: u64,
+        /// MIME type, when the sender knows it. Missing means unknown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mime: Option<String>,
+    },
+    /// Receiver will save the file.
+    FileAccept {
+        transfer: String,
+    },
+    /// Receiver refuses the offer.
+    FileReject {
+        transfer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// One ordered chunk. `data` is standard base64 of at most 256 KiB of raw bytes.
+    FileChunk {
+        transfer: String,
+        seq: u64,
+        data: String,
+    },
+    /// Sender has finished. `sha256` is the hex digest of the whole file.
+    FileDone {
+        transfer: String,
+        sha256: String,
+    },
+    /// Receiver checked the size and SHA-256.
+    FileResult {
+        transfer: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Either side gives up. The receiver deletes the partial file.
+    FileCancel {
+        transfer: String,
+    },
     Ping,
     Pong,
     /// Any message type this build doesn't know. Ignored, so newer phones still work.
@@ -611,5 +652,141 @@ mod tests {
         assert_eq!(caller_label("", ""), "Unknown caller");
         assert_eq!(caller_label("  ", " \t"), "Unknown caller");
         assert_eq!(caller_label("\n", ""), "Unknown caller");
+    }
+
+    #[test]
+    fn file_offer_accept_reject_and_cancel_round_trip() {
+        let id = "00112233445566778899aabbccddeeff";
+        let offer = Message::FileOffer {
+            transfer: id.into(),
+            name: "photo.jpg".into(),
+            size: 12,
+            mime: Some("image/jpeg".into()),
+        };
+        assert_eq!(
+            offer.to_line(),
+            r#"{"type":"file_offer","transfer":"00112233445566778899aabbccddeeff","name":"photo.jpg","size":12,"mime":"image/jpeg"}"#,
+        );
+        assert_eq!(Message::from_line(&offer.to_line()).unwrap(), offer);
+
+        let bare = Message::FileOffer {
+            transfer: id.into(),
+            name: "photo.jpg".into(),
+            size: 12,
+            mime: None,
+        };
+        assert_eq!(
+            bare.to_line(),
+            r#"{"type":"file_offer","transfer":"00112233445566778899aabbccddeeff","name":"photo.jpg","size":12}"#,
+        );
+        assert_eq!(Message::from_line(&bare.to_line()).unwrap(), bare);
+
+        let accept = Message::FileAccept {
+            transfer: id.into(),
+        };
+        assert_eq!(
+            accept.to_line(),
+            r#"{"type":"file_accept","transfer":"00112233445566778899aabbccddeeff"}"#,
+        );
+        assert_eq!(Message::from_line(&accept.to_line()).unwrap(), accept);
+
+        let reject = Message::FileReject {
+            transfer: id.into(),
+            reason: Some("no space".into()),
+        };
+        assert_eq!(
+            reject.to_line(),
+            r#"{"type":"file_reject","transfer":"00112233445566778899aabbccddeeff","reason":"no space"}"#,
+        );
+        assert_eq!(Message::from_line(&reject.to_line()).unwrap(), reject);
+        assert_eq!(
+            Message::from_line(
+                r#"{"type":"file_reject","transfer":"00112233445566778899aabbccddeeff"}"#,
+            )
+            .unwrap(),
+            Message::FileReject {
+                transfer: id.into(),
+                reason: None,
+            }
+        );
+
+        let cancel = Message::FileCancel {
+            transfer: id.into(),
+        };
+        assert_eq!(
+            cancel.to_line(),
+            r#"{"type":"file_cancel","transfer":"00112233445566778899aabbccddeeff"}"#,
+        );
+        assert_eq!(Message::from_line(&cancel.to_line()).unwrap(), cancel);
+    }
+
+    #[test]
+    fn file_chunk_done_and_result_round_trip() {
+        let id = "00112233445566778899aabbccddeeff";
+        let chunk = Message::FileChunk {
+            transfer: id.into(),
+            seq: 0,
+            data: "aGVsbG8=".into(),
+        };
+        assert_eq!(
+            chunk.to_line(),
+            r#"{"type":"file_chunk","transfer":"00112233445566778899aabbccddeeff","seq":0,"data":"aGVsbG8="}"#,
+        );
+        assert_eq!(Message::from_line(&chunk.to_line()).unwrap(), chunk);
+
+        let hash = "ab".repeat(32);
+        let done = Message::FileDone {
+            transfer: id.into(),
+            sha256: hash.clone(),
+        };
+        assert_eq!(
+            done.to_line(),
+            format!(r#"{{"type":"file_done","transfer":"{id}","sha256":"{hash}"}}"#),
+        );
+        assert_eq!(Message::from_line(&done.to_line()).unwrap(), done);
+
+        let ok = Message::FileResult {
+            transfer: id.into(),
+            ok: true,
+            error: None,
+        };
+        assert_eq!(
+            ok.to_line(),
+            r#"{"type":"file_result","transfer":"00112233445566778899aabbccddeeff","ok":true}"#,
+        );
+        assert_eq!(Message::from_line(&ok.to_line()).unwrap(), ok);
+        assert_eq!(
+            Message::from_line(
+                r#"{"type":"file_result","transfer":"00112233445566778899aabbccddeeff","ok":true}"#,
+            )
+            .unwrap(),
+            Message::FileResult {
+                transfer: id.into(),
+                ok: true,
+                error: None,
+            }
+        );
+
+        let err = Message::FileResult {
+            transfer: id.into(),
+            ok: false,
+            error: Some("wrong hash".into()),
+        };
+        assert_eq!(
+            err.to_line(),
+            r#"{"type":"file_result","transfer":"00112233445566778899aabbccddeeff","ok":false,"error":"wrong hash"}"#,
+        );
+        assert_eq!(Message::from_line(&err.to_line()).unwrap(), err);
+        assert_eq!(
+            Message::from_line(
+                r#"{"type":"file_result","transfer":"00112233445566778899aabbccddeeff","ok":false}"#,
+            )
+            .unwrap(),
+            Message::FileResult {
+                transfer: id.into(),
+                ok: false,
+                error: None,
+            }
+        );
     }
 }

@@ -1,9 +1,12 @@
 //! End-to-end: a Rust "phone" pairs with the real link server over real TLS.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use seam_core::link::client::PhoneClient;
 use seam_core::link::protocol::{CallActionKind, CallState};
 use seam_core::link::{LinkEvent, LinkServer, Message, PairingInfo, PhoneNotification};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -402,4 +405,257 @@ async fn phone_sends_a_ringing_call_and_receives_call_action() {
             name: String::new(),
         }
     );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+async fn next_msg(phone: &mut PhoneClient) -> Message {
+    tokio::time::timeout(Duration::from_secs(5), phone.recv())
+        .await
+        .expect("timed out waiting for a frame")
+        .expect("phone connection closed")
+}
+
+#[tokio::test]
+async fn phone_sends_a_file_and_a_wrong_hash_leaves_nothing() {
+    let (server, mut events, port) = start("file").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    let download = server.download_dir().to_path_buf();
+    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let id = "ab".repeat(16);
+    phone
+        .send(&Message::FileOffer {
+            transfer: id.clone(),
+            name: "../../etc/passwd".into(),
+            size: payload.len() as u64,
+            mime: Some("application/octet-stream".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_msg(&mut phone).await,
+        Message::FileAccept {
+            transfer: id.clone()
+        }
+    );
+
+    let mut seq = 0u64;
+    for chunk in payload.chunks(200_000) {
+        phone
+            .send(&Message::FileChunk {
+                transfer: id.clone(),
+                seq,
+                data: STANDARD.encode(chunk),
+            })
+            .await
+            .unwrap();
+        if seq == 0 {
+            // Other messages may be interleaved with chunks.
+            phone
+                .send(&Message::Battery {
+                    level: 50,
+                    charging: false,
+                })
+                .await
+                .unwrap();
+        }
+        seq += 1;
+    }
+    assert!(seq >= 5, "expected several chunks, sent {seq}");
+    phone
+        .send(&Message::FileDone {
+            transfer: id.clone(),
+            sha256: sha256_hex(&payload),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_msg(&mut phone).await,
+        Message::FileResult {
+            transfer: id.clone(),
+            ok: true,
+            error: None,
+        }
+    );
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-1".into(),
+            level: 50,
+            charging: false,
+        }
+    );
+    match next_event(&mut events).await {
+        LinkEvent::FileReceived { phone, path } => {
+            assert_eq!(phone, "phone-1");
+            assert_eq!(path.parent(), Some(download.as_path()));
+            assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("passwd"));
+            assert_eq!(std::fs::read(&path).unwrap(), payload);
+        }
+        other => panic!("expected FileReceived, got {other:?}"),
+    }
+    assert!(file_names(&download).iter().all(|n| !n.ends_with(".part")));
+
+    // A second file with the same name must not overwrite the first.
+    let id2 = "cd".repeat(16);
+    let second = b"v2!";
+    phone
+        .send(&Message::FileOffer {
+            transfer: id2.clone(),
+            name: "../../etc/passwd".into(),
+            size: second.len() as u64,
+            mime: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_msg(&mut phone).await,
+        Message::FileAccept {
+            transfer: id2.clone()
+        }
+    );
+    phone
+        .send(&Message::FileChunk {
+            transfer: id2.clone(),
+            seq: 0,
+            data: STANDARD.encode(second),
+        })
+        .await
+        .unwrap();
+    phone
+        .send(&Message::FileDone {
+            transfer: id2.clone(),
+            sha256: sha256_hex(second),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_msg(&mut phone).await,
+        Message::FileResult {
+            transfer: id2,
+            ok: true,
+            error: None,
+        }
+    );
+    match next_event(&mut events).await {
+        LinkEvent::FileReceived { path, .. } => {
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("passwd (1)")
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), second);
+        }
+        other => panic!("expected FileReceived, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(download.join("passwd")).unwrap(), payload);
+
+    // A wrong hash deletes the partial and leaves nothing new behind.
+    let before = file_names(&download);
+    let bad_id = "ef".repeat(16);
+    let bad = b"nope";
+    phone
+        .send(&Message::FileOffer {
+            transfer: bad_id.clone(),
+            name: "evil.bin".into(),
+            size: bad.len() as u64,
+            mime: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_msg(&mut phone).await,
+        Message::FileAccept { .. }
+    ));
+    phone
+        .send(&Message::FileChunk {
+            transfer: bad_id.clone(),
+            seq: 0,
+            data: STANDARD.encode(bad),
+        })
+        .await
+        .unwrap();
+    phone
+        .send(&Message::FileDone {
+            transfer: bad_id.clone(),
+            sha256: "00".repeat(32),
+        })
+        .await
+        .unwrap();
+    match next_msg(&mut phone).await {
+        Message::FileResult {
+            ok: false,
+            transfer,
+            ..
+        } => assert_eq!(transfer, bad_id),
+        other => panic!("expected file_result ok:false, got {other:?}"),
+    }
+    assert_eq!(file_names(&download), before);
+    assert!(!download.join("evil.bin").exists());
+    assert!(file_names(&download).iter().all(|n| !n.ends_with(".part")));
+    assert_eq!(std::fs::read(download.join("passwd")).unwrap(), payload);
+
+    // file_cancel deletes the partial file.
+    let cancel_id = "12".repeat(16);
+    phone
+        .send(&Message::FileOffer {
+            transfer: cancel_id.clone(),
+            name: "partial.bin".into(),
+            size: 4,
+            mime: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_msg(&mut phone).await,
+        Message::FileAccept { .. }
+    ));
+    phone
+        .send(&Message::FileChunk {
+            transfer: cancel_id.clone(),
+            seq: 0,
+            data: STANDARD.encode(b"part"),
+        })
+        .await
+        .unwrap();
+    phone
+        .send(&Message::FileCancel {
+            transfer: cancel_id,
+        })
+        .await
+        .unwrap();
+    phone
+        .send(&Message::Battery {
+            level: 9,
+            charging: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-1".into(),
+            level: 9,
+            charging: true,
+        }
+    );
+    assert!(!download.join("partial.bin").exists());
+    assert!(file_names(&download).iter().all(|n| !n.ends_with(".part")));
+    assert_eq!(file_names(&download), before);
+    assert_eq!(std::fs::read(download.join("passwd (1)")).unwrap(), second);
 }

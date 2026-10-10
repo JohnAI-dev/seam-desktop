@@ -619,6 +619,9 @@ fn handle_event(
                     seq,
                 });
             }
+            LinkEvent::FileReceived { .. } => {
+                // Saved already. The window lists received files in a later change.
+            }
         }
     }
     if let Some(payload) = reply_push {

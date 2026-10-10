@@ -1,14 +1,17 @@
-//! The desktop side of the link: a TLS server phones connect to.
+//! The desktop side of the link: a TLS server phones connect to. Files a phone
+//! sends are streamed into the download folder.
 
 use super::protocol::{self, Message, PairingInfo, PhoneNotification, MAX_FRAME};
 use super::store::{PairedDevice, Store};
+use super::transfer;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
 use std::collections::HashMap;
+use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -69,6 +72,13 @@ pub enum LinkEvent {
         number: String,
         name: String,
     },
+    /// A file from the phone was saved under the download folder.
+    FileReceived {
+        /// Paired device id of the phone that sent the file.
+        phone: String,
+        /// Final path of the saved file.
+        path: PathBuf,
+    },
 }
 
 struct Pending {
@@ -85,6 +95,8 @@ struct Inner {
     events: mpsc::UnboundedSender<LinkEvent>,
     /// Outgoing queues of the phones connected right now.
     outboxes: Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>,
+    /// Folder received files are moved into. Temp files live here too.
+    download_dir: PathBuf,
 }
 
 /// The link server. Cheap to clone; all clones share state.
@@ -112,6 +124,8 @@ impl LinkServer {
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der)),
             )
             .map_err(io::Error::other)?;
+        let download_dir = dir.join("downloads");
+        fs::create_dir_all(&download_dir)?;
         let (events, rx) = mpsc::unbounded_channel();
         let inner = Inner {
             store,
@@ -121,6 +135,7 @@ impl LinkServer {
             pending: Mutex::new(None),
             events,
             outboxes: Mutex::new(HashMap::new()),
+            download_dir,
         };
         Ok((
             Self {
@@ -133,6 +148,11 @@ impl LinkServer {
     /// SHA-256 fingerprint of this desktop's certificate.
     pub fn fingerprint(&self) -> &str {
         &self.inner.fingerprint
+    }
+
+    /// Folder where a file received from a phone is saved.
+    pub fn download_dir(&self) -> &Path {
+        &self.inner.download_dir
     }
 
     pub fn desktop_name(&self) -> &str {
@@ -331,6 +351,124 @@ impl LinkServer {
         Ok(true)
     }
 
+    /// Handle one inbound file frame. Other messages are returned so the session can emit them.
+    async fn handle_file<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        device_id: &str,
+        inbound: &mut Option<transfer::Inbound>,
+        msg: Message,
+        writer: &mut W,
+    ) -> io::Result<Option<Message>> {
+        match msg {
+            Message::FileOffer {
+                transfer,
+                name,
+                size,
+                ..
+            } => {
+                if let Err(reason) = transfer::check_offer(&transfer, size) {
+                    send(
+                        writer,
+                        &Message::FileReject {
+                            transfer,
+                            reason: Some(reason.to_string()),
+                        },
+                    )
+                    .await?;
+                } else {
+                    // Drop a partial first so its cleanup cannot remove the new temp file.
+                    inbound.take();
+                    match transfer::Inbound::open(&self.inner.download_dir, &transfer, &name, size)
+                    {
+                        Ok(file) => {
+                            *inbound = Some(file);
+                            send(writer, &Message::FileAccept { transfer }).await?;
+                        }
+                        Err(reason) => {
+                            send(
+                                writer,
+                                &Message::FileReject {
+                                    transfer,
+                                    reason: Some(reason),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Message::FileChunk {
+                transfer,
+                seq,
+                data,
+            } => {
+                let failed = match inbound.as_mut() {
+                    Some(file) => file.push_chunk(&transfer, seq, &data).err(),
+                    None => Some("no transfer".to_string()),
+                };
+                if let Some(reason) = failed {
+                    inbound.take();
+                    send(
+                        writer,
+                        &Message::FileResult {
+                            transfer,
+                            ok: false,
+                            error: Some(reason),
+                        },
+                    )
+                    .await?;
+                }
+                Ok(None)
+            }
+            Message::FileDone { transfer, sha256 } => {
+                let result = match inbound.take() {
+                    Some(file) => file.finish(&self.inner.download_dir, &transfer, &sha256),
+                    None => Err("no transfer".to_string()),
+                };
+                match result {
+                    Ok(path) => {
+                        send(
+                            writer,
+                            &Message::FileResult {
+                                transfer,
+                                ok: true,
+                                error: None,
+                            },
+                        )
+                        .await?;
+                        let _ = self.inner.events.send(LinkEvent::FileReceived {
+                            phone: device_id.to_string(),
+                            path,
+                        });
+                    }
+                    Err(reason) => {
+                        send(
+                            writer,
+                            &Message::FileResult {
+                                transfer,
+                                ok: false,
+                                error: Some(reason),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+                Ok(None)
+            }
+            Message::FileCancel { transfer } => {
+                if inbound
+                    .as_ref()
+                    .is_some_and(|file| file.is_transfer(&transfer))
+                {
+                    inbound.take();
+                }
+                Ok(None)
+            }
+            other => Ok(Some(other)),
+        }
+    }
+
     async fn session<W: tokio::io::AsyncWrite + Unpin>(
         &self,
         device_id: &str,
@@ -341,6 +479,8 @@ impl LinkServer {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;
         let mut missed_pongs = 0u8;
+        // At most one inbound file. Dropping it deletes a partial download.
+        let mut inbound: Option<transfer::Inbound> = None;
         loop {
             tokio::select! {
                 frame = frames.recv() => {
@@ -353,6 +493,12 @@ impl LinkServer {
                     if self.inner.store.device(device_id).is_none() {
                         return reject(writer, "this phone was removed on the computer").await;
                     }
+                    let Some(msg) = self
+                        .handle_file(device_id, &mut inbound, msg, writer)
+                        .await?
+                    else {
+                        continue;
+                    };
                     let id = device_id.to_string();
                     let event = match msg {
                         Message::Notification(n) => Some(LinkEvent::Notification { device_id: id, notification: n }),
@@ -475,5 +621,277 @@ pub fn local_ip() -> Option<String> {
             Some(a.ip().to_string())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinkEvent, LinkServer};
+    use crate::link::transfer::{Inbound, MAX_FILE_BYTES};
+    use crate::link::Message;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "seam-file-srv-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn partials(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".part"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    async fn drive(
+        server: &LinkServer,
+        inbound: &mut Option<Inbound>,
+        msg: Message,
+    ) -> Option<Message> {
+        let mut writer = Vec::new();
+        let returned = server
+            .handle_file("phone-1", inbound, msg, &mut writer)
+            .await
+            .unwrap();
+        assert!(returned.is_none(), "file messages are consumed");
+        let text = String::from_utf8(writer).unwrap();
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(Message::from_line(&text).unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_file_saves_on_success_and_deletes_on_failure() {
+        let dir = scratch("recv");
+        let (server, mut events) = LinkServer::new(&dir, "Desk".into()).unwrap();
+        let download = server.download_dir().to_path_buf();
+        let mut inbound = None;
+        let id = "ab".repeat(16);
+
+        let huge = drive(
+            &server,
+            &mut inbound,
+            Message::FileOffer {
+                transfer: id.clone(),
+                name: "huge.bin".into(),
+                size: MAX_FILE_BYTES + 1,
+                mime: None,
+            },
+        )
+        .await;
+        assert!(matches!(huge, Some(Message::FileReject { .. })));
+        assert!(inbound.is_none());
+
+        let accept = drive(
+            &server,
+            &mut inbound,
+            Message::FileOffer {
+                transfer: id.clone(),
+                name: "../../etc/passwd".into(),
+                size: 5,
+                mime: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            accept,
+            Some(Message::FileAccept {
+                transfer: id.clone()
+            })
+        );
+        assert!(drive(
+            &server,
+            &mut inbound,
+            Message::FileChunk {
+                transfer: id.clone(),
+                seq: 0,
+                data: STANDARD.encode(b"hello"),
+            },
+        )
+        .await
+        .is_none());
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let done = drive(
+            &server,
+            &mut inbound,
+            Message::FileDone {
+                transfer: id.clone(),
+                sha256: hash,
+            },
+        )
+        .await;
+        assert_eq!(
+            done,
+            Some(Message::FileResult {
+                transfer: id.clone(),
+                ok: true,
+                error: None,
+            })
+        );
+        match events.try_recv().unwrap() {
+            LinkEvent::FileReceived { phone, path } => {
+                assert_eq!(phone, "phone-1");
+                assert_eq!(path, download.join("passwd"));
+                assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(partials(&download).is_empty());
+        assert!(inbound.is_none());
+
+        let bad = "cd".repeat(16);
+        assert!(matches!(
+            drive(
+                &server,
+                &mut inbound,
+                Message::FileOffer {
+                    transfer: bad.clone(),
+                    name: "evil.bin".into(),
+                    size: 4,
+                    mime: None,
+                },
+            )
+            .await,
+            Some(Message::FileAccept { .. })
+        ));
+        drive(
+            &server,
+            &mut inbound,
+            Message::FileChunk {
+                transfer: bad.clone(),
+                seq: 0,
+                data: STANDARD.encode(b"nope"),
+            },
+        )
+        .await;
+        let failed = drive(
+            &server,
+            &mut inbound,
+            Message::FileDone {
+                transfer: bad.clone(),
+                sha256: "00".repeat(32),
+            },
+        )
+        .await;
+        assert!(matches!(
+            failed,
+            Some(Message::FileResult { ok: false, .. })
+        ));
+        assert!(!download.join("evil.bin").exists());
+        assert_eq!(std::fs::read(download.join("passwd")).unwrap(), b"hello");
+        assert!(partials(&download).is_empty());
+        assert!(events.try_recv().is_err());
+
+        let cancel_id = "ef".repeat(16);
+        drive(
+            &server,
+            &mut inbound,
+            Message::FileOffer {
+                transfer: cancel_id.clone(),
+                name: "partial.bin".into(),
+                size: 4,
+                mime: None,
+            },
+        )
+        .await;
+        drive(
+            &server,
+            &mut inbound,
+            Message::FileChunk {
+                transfer: cancel_id.clone(),
+                seq: 0,
+                data: STANDARD.encode(b"part"),
+            },
+        )
+        .await;
+        assert!(partials(&download).iter().any(|n| n.contains(&cancel_id)));
+        assert!(drive(
+            &server,
+            &mut inbound,
+            Message::FileCancel {
+                transfer: cancel_id.clone(),
+            },
+        )
+        .await
+        .is_none());
+        assert!(inbound.is_none());
+        assert!(partials(&download).is_empty());
+        assert!(!download.join("partial.bin").exists());
+
+        let seq_id = "12".repeat(16);
+        drive(
+            &server,
+            &mut inbound,
+            Message::FileOffer {
+                transfer: seq_id.clone(),
+                name: "seq.bin".into(),
+                size: 2,
+                mime: None,
+            },
+        )
+        .await;
+        let wrong_seq = drive(
+            &server,
+            &mut inbound,
+            Message::FileChunk {
+                transfer: seq_id.clone(),
+                seq: 1,
+                data: STANDARD.encode(b"ab"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            wrong_seq,
+            Some(Message::FileResult { ok: false, .. })
+        ));
+        assert!(inbound.is_none());
+        assert!(!download.join("seq.bin").exists());
+        assert!(partials(&download).is_empty());
+
+        let big_id = "34".repeat(16);
+        drive(
+            &server,
+            &mut inbound,
+            Message::FileOffer {
+                transfer: big_id.clone(),
+                name: "big.bin".into(),
+                size: 2,
+                mime: None,
+            },
+        )
+        .await;
+        let too_big = drive(
+            &server,
+            &mut inbound,
+            Message::FileChunk {
+                transfer: big_id,
+                seq: 0,
+                data: STANDARD.encode(b"abcd"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            too_big,
+            Some(Message::FileResult { ok: false, .. })
+        ));
+        assert!(!download.join("big.bin").exists());
+        assert!(partials(&download).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
