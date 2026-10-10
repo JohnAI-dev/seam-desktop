@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 /// Ports tried for the link, in order.
@@ -25,13 +25,33 @@ pub struct PhoneView {
 /// One row in the phone-notification list.
 ///
 /// Serialized flat: `phone` and the `PhoneNotification` fields (`id`, `app`,
-/// `app_name`, `title`, `text`, `time`) are top-level keys. The dismiss button
-/// reads `n.phone` and `n.id` from that object, same as `n.app_name`.
+/// `app_name`, `title`, `text`, `time`, `replyable`) are top-level keys. The
+/// dismiss and reply buttons read `n.phone` and `n.id` from that object.
+/// After a `reply_result`, `reply_seq` / `reply_ok` / `reply_error` are included
+/// so the window can apply the result even if it missed the push.
 #[derive(Serialize, Clone)]
 pub struct NotificationView {
     phone: String,
     #[serde(flatten)]
     notification: PhoneNotification,
+    /// Monotonic id of the latest reply_result for this row. Absent until one arrives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_error: Option<String>,
+}
+
+/// Pushed to the window as soon as a phone answers a reply.
+#[derive(Clone, Serialize)]
+struct ReplyResultPush {
+    phone: String,
+    id: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    seq: u64,
 }
 
 #[derive(Serialize)]
@@ -56,6 +76,8 @@ struct Shared {
     error: Option<String>,
     phones: HashMap<String, PhoneView>,
     notifications: VecDeque<NotificationView>,
+    /// Monotonic so a replaced notification row cannot reuse a reply_result id.
+    next_reply_seq: u64,
 }
 
 impl Shared {
@@ -65,6 +87,44 @@ impl Shared {
         self.notifications
             .retain(|n| n.phone != phone || n.notification.id != id);
         self.notifications.len() != before
+    }
+
+    /// Record a phone's reply_result on that notification. `None` if it is not listed.
+    fn apply_reply_result(
+        &mut self,
+        phone: &str,
+        id: &str,
+        ok: bool,
+        error: Option<String>,
+    ) -> Option<u64> {
+        let found = self
+            .notifications
+            .iter()
+            .any(|n| n.phone == phone && n.notification.id == id);
+        if !found {
+            return None;
+        }
+        self.next_reply_seq = self.next_reply_seq.saturating_add(1);
+        let seq = self.next_reply_seq;
+        let n = self
+            .notifications
+            .iter_mut()
+            .find(|n| n.phone == phone && n.notification.id == id)?;
+        n.reply_seq = Some(seq);
+        n.reply_ok = Some(ok);
+        n.reply_error = if ok {
+            None
+        } else {
+            Some(reply_error_text(error))
+        };
+        Some(seq)
+    }
+}
+
+fn reply_error_text(error: Option<String>) -> String {
+    match error {
+        Some(text) if !text.trim().is_empty() => text,
+        _ => "could not send the reply".to_string(),
     }
 }
 
@@ -128,6 +188,41 @@ impl Link {
         if let Some(server) = &self.server {
             // False when the phone is offline; the list entry is already gone.
             let _sent = server.send_to(phone, Message::Dismiss { id: id.to_string() });
+        }
+    }
+
+    /// Send an inline reply to the phone that posted this notification.
+    ///
+    /// Text is trimmed. Empty text and text longer than 5 000 characters are rejected.
+    pub fn reply_notification(&self, phone: &str, id: &str, text: &str) -> Result<(), String> {
+        let text = link::protocol::normalize_reply_text(text).map_err(str::to_string)?;
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        let replyable = {
+            let shared = self.shared.lock().unwrap();
+            shared
+                .notifications
+                .iter()
+                .find(|n| n.phone == phone && n.notification.id == id)
+                .map(|n| n.notification.replyable)
+        };
+        match replyable {
+            Some(true) => {}
+            Some(false) => return Err("this notification cannot be replied to".into()),
+            None => return Err("this notification is gone".into()),
+        }
+        if server.send_to(
+            phone,
+            Message::Reply {
+                id: id.to_string(),
+                text,
+            },
+        ) {
+            Ok(())
+        } else {
+            Err("this phone is not connected".into())
         }
     }
 
@@ -346,6 +441,7 @@ fn handle_event(
     event: LinkEvent,
 ) {
     let mut show: Option<PhoneNotification> = None;
+    let mut reply_push: Option<ReplyResultPush> = None;
     {
         let mut s = shared.lock().unwrap();
         match event {
@@ -382,6 +478,9 @@ fn handle_event(
                 s.notifications.push_front(NotificationView {
                     phone: device_id,
                     notification: notification.clone(),
+                    reply_seq: None,
+                    reply_ok: None,
+                    reply_error: None,
                 });
                 s.notifications.truncate(KEEP_NOTIFICATIONS);
                 show = Some(notification);
@@ -395,7 +494,34 @@ fn handle_event(
                 // Failure is ignored: headless CI has no clipboard.
                 set_system_clipboard(app, text);
             }
+            LinkEvent::ReplyResult {
+                device_id,
+                id,
+                ok,
+                error,
+            } => {
+                let shown = if ok {
+                    None
+                } else {
+                    Some(reply_error_text(error.clone()))
+                };
+                let seq = s
+                    .apply_reply_result(&device_id, &id, ok, error)
+                    .unwrap_or(0);
+                reply_push = Some(ReplyResultPush {
+                    phone: device_id,
+                    id,
+                    ok,
+                    error: shown,
+                    seq,
+                });
+            }
         }
+    }
+    if let Some(payload) = reply_push {
+        // Push immediately. link_status still carries the result, so a missed event
+        // is applied on the next refresh instead of leaving the composer open.
+        let _ = app.emit("reply-result", payload);
     }
     if let (Some(n), true) = (show, system_notifications) {
         let title = if n.title.is_empty() {
@@ -430,7 +556,11 @@ mod tests {
                 title: String::new(),
                 text: String::new(),
                 time: 1,
+                replyable: false,
             },
+            reply_seq: None,
+            reply_ok: None,
+            reply_error: None,
         }
     }
 
@@ -511,6 +641,8 @@ mod tests {
         assert_eq!(notes[0]["title"].as_str(), Some(""));
         assert_eq!(notes[0]["text"].as_str(), Some(""));
         assert_eq!(notes[0]["time"].as_i64(), Some(1));
+        assert_eq!(notes[0]["replyable"].as_bool(), Some(false));
+        assert!(notes[0].get("reply_seq").is_none());
         assert_eq!(notes[1]["phone"].as_str(), Some("phone-b"));
         assert_eq!(notes[1]["id"].as_str(), Some("n2"));
 
@@ -608,6 +740,125 @@ mod tests {
         // Returns before touching the clipboard, so headless CI can run this.
         assert_eq!(
             link.send_clipboard("phone-1").unwrap_err(),
+            "this phone is not connected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replyable_and_reply_result_are_on_the_notification_the_window_polls() {
+        let mut note = view("phone-a", "n1");
+        note.notification.replyable = true;
+        note.notification.title = "Anna".into();
+        let shared = Shared {
+            notifications: VecDeque::from([note]),
+            ..Shared::default()
+        };
+        let link = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(shared)),
+        };
+        {
+            let mut guard = link.shared.lock().unwrap();
+            assert_eq!(
+                guard.apply_reply_result("phone-a", "missing", true, None),
+                None
+            );
+            assert_eq!(
+                guard.apply_reply_result("phone-a", "n1", true, None),
+                Some(1)
+            );
+            assert_eq!(
+                guard.apply_reply_result(
+                    "phone-a",
+                    "n1",
+                    false,
+                    Some("notification is gone".into())
+                ),
+                Some(2)
+            );
+            assert_eq!(
+                guard.apply_reply_result("phone-a", "n1", false, Some("  ".into())),
+                Some(3)
+            );
+            assert_eq!(
+                guard.notifications[0].reply_error.as_deref(),
+                Some("could not send the reply")
+            );
+        }
+        let json = serde_json::to_value(link.status()).unwrap();
+        let note = &json["notifications"][0];
+        assert!(note.get("notification").is_none());
+        assert_eq!(note["phone"], "phone-a");
+        assert_eq!(note["id"], "n1");
+        assert_eq!(note["replyable"], true);
+        assert_eq!(note["title"], "Anna");
+        assert_eq!(note["reply_seq"], 3);
+        assert_eq!(note["reply_ok"], false);
+        assert_eq!(note["reply_error"], "could not send the reply");
+    }
+
+    #[test]
+    fn reply_notification_rejects_empty_or_too_long_text() {
+        let link = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            link.reply_notification("phone-a", "n1", "   ").unwrap_err(),
+            "reply is empty"
+        );
+        assert_eq!(
+            link.reply_notification("phone-a", "n1", "").unwrap_err(),
+            "reply is empty"
+        );
+        assert_eq!(
+            link.reply_notification("phone-a", "n1", &"x".repeat(5_001))
+                .unwrap_err(),
+            "reply is too long"
+        );
+        assert_eq!(
+            link.reply_notification("phone-a", "n1", &"你".repeat(5_001))
+                .unwrap_err(),
+            "reply is too long"
+        );
+        // Trimmed 5 000 characters is allowed; the link itself is what fails here.
+        let padded = format!("  {}  ", "x".repeat(5_000));
+        assert_eq!(
+            link.reply_notification("phone-a", "n1", &padded)
+                .unwrap_err(),
+            "the phone link is not running"
+        );
+    }
+
+    #[test]
+    fn reply_notification_requires_a_replyable_notification_on_a_connected_phone() {
+        let dir = std::env::temp_dir().join(format!("seam-reply-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Test Desktop".into()).unwrap();
+        assert!(server.connected().is_empty());
+        let mut replyable = view("phone-a", "n1");
+        replyable.notification.replyable = true;
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared {
+                notifications: VecDeque::from([replyable, view("phone-a", "n2")]),
+                ..Shared::default()
+            })),
+        };
+        assert_eq!(
+            link.reply_notification("phone-a", "n2", "hello")
+                .unwrap_err(),
+            "this notification cannot be replied to"
+        );
+        assert_eq!(
+            link.reply_notification("phone-a", "missing", "hello")
+                .unwrap_err(),
+            "this notification is gone"
+        );
+        assert_eq!(
+            link.reply_notification("phone-a", "n1", "  hello  ")
+                .unwrap_err(),
             "this phone is not connected"
         );
         let _ = std::fs::remove_dir_all(&dir);

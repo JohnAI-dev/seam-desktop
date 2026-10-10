@@ -104,6 +104,16 @@ fn dismiss_notification(phone_link: State<link::Link>, phone: String, id: String
 }
 
 #[tauri::command]
+fn reply_notification(
+    phone_link: State<link::Link>,
+    phone: String,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    phone_link.reply_notification(&phone, &id, &text)
+}
+
+#[tauri::command]
 fn send_clipboard(phone_link: State<link::Link>, id: String) -> Result<(), String> {
     // Synchronous commands already run on the main thread. Read the clipboard
     // there; do not hop through run_on_main_thread and block on the result.
@@ -183,6 +193,7 @@ pub fn run() {
             start_pairing,
             forget_phone,
             dismiss_notification,
+            reply_notification,
             send_clipboard,
             update_status,
             restart_to_update,

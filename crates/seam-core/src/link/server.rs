@@ -55,6 +55,13 @@ pub enum LinkEvent {
         device_id: String,
         text: String,
     },
+    /// Phone answered an inline notification reply.
+    ReplyResult {
+        device_id: String,
+        id: String,
+        ok: bool,
+        error: Option<String>,
+    },
 }
 
 struct Pending {
@@ -345,6 +352,12 @@ impl LinkServer {
                         Message::NotificationRemoved { id: nid } => Some(LinkEvent::NotificationRemoved { device_id: id, id: nid }),
                         Message::Battery { level, charging } => Some(LinkEvent::Battery { device_id: id, level: level.min(100), charging }),
                         Message::Clipboard { text } => Some(LinkEvent::Clipboard { device_id: id, text }),
+                        Message::ReplyResult { id: nid, ok, error } => Some(LinkEvent::ReplyResult {
+                            device_id: id,
+                            id: nid,
+                            ok,
+                            error,
+                        }),
                         Message::Pong => { missed_pongs = 0; None }
                         Message::Ping => { send(writer, &Message::Pong).await?; None }
                         _ => None,

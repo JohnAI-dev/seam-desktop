@@ -70,7 +70,270 @@ function showError(msg) {
   e.hidden = !msg;
 }
 
+// How long "Sent" stays up. The timer re-renders when it fires so Reply comes back
+// without waiting for an unrelated status poll.
+const REPLY_SENT_MS = 3000;
+const MAX_REPLY_CHARS = 5000;
+
+let lastLink = null;
+const composers = new Map();
+
+function noteKey(phone, id) {
+  return JSON.stringify([phone, id]);
+}
+
+function noteReplyState(phone, id) {
+  const key = noteKey(phone, id);
+  let state = composers.get(key);
+  if (!state) {
+    state = {
+      open: false,
+      draft: "",
+      sending: false,
+      error: "",
+      sentUntil: 0,
+      appliedSeq: 0,
+      sentTimer: null,
+    };
+    composers.set(key, state);
+  }
+  return state;
+}
+
+function findReplyInput(key) {
+  for (const input of document.querySelectorAll("input.reply-text")) {
+    if (input.dataset.replyFor === key) return input;
+  }
+  return null;
+}
+
+function captureReplyFocus() {
+  const active = document.activeElement;
+  if (!active || !active.classList || !active.classList.contains("reply-text")) return null;
+  return {
+    key: active.dataset.replyFor,
+    start: active.selectionStart,
+    end: active.selectionEnd,
+  };
+}
+
+function restoreReplyFocus(saved) {
+  if (!saved) return;
+  const input = findReplyInput(saved.key);
+  if (!input) return;
+  input.focus();
+  if (typeof saved.start === "number") {
+    try {
+      input.setSelectionRange(saved.start, saved.end);
+    } catch (e) {
+      /* the input may not accept a selection */
+    }
+  }
+}
+
+function scheduleSentClear(key) {
+  const state = composers.get(key);
+  if (!state) return;
+  clearTimeout(state.sentTimer);
+  state.sentTimer = setTimeout(() => {
+    const cur = composers.get(key);
+    if (!cur) return;
+    cur.sentUntil = 0;
+    cur.sentTimer = null;
+    // Re-render so "Sent" clears and the Reply button comes back on its own.
+    if (lastLink) renderLink(lastLink);
+    else refreshLink().catch(() => {});
+  }, REPLY_SENT_MS);
+}
+
+function applyReplyOutcome(phone, id, outcome) {
+  if (typeof phone !== "string" || typeof id !== "string") return;
+  const state = noteReplyState(phone, id);
+  if (outcome.seq && state.appliedSeq === outcome.seq) return;
+  if (outcome.seq) state.appliedSeq = outcome.seq;
+  state.sending = false;
+  if (outcome.ok) {
+    state.open = false;
+    state.draft = "";
+    state.error = "";
+    state.sentUntil = Date.now() + REPLY_SENT_MS;
+    scheduleSentClear(noteKey(phone, id));
+  } else {
+    state.sentUntil = 0;
+    clearTimeout(state.sentTimer);
+    state.sentTimer = null;
+    state.error = outcome.error || "could not send the reply";
+    state.open = true;
+  }
+}
+
+function absorbStatusReply(n) {
+  const seq = n.reply_seq || 0;
+  const state = composers.get(noteKey(n.phone, n.id));
+  // A pushed event may already be newer than this status snapshot.
+  if (state && seq < state.appliedSeq) return;
+  if (!seq) return;
+  applyReplyOutcome(n.phone, n.id, {
+    ok: n.reply_ok === true,
+    error: n.reply_error || "",
+    seq,
+  });
+}
+
+function onPushedReplyResult(payload) {
+  applyReplyOutcome(payload.phone, payload.id, {
+    ok: payload.ok === true,
+    error: payload.error || "",
+    seq: payload.seq || 0,
+  });
+  if (lastLink) renderLink(lastLink);
+  else refreshLink().catch((e) => showLinkError(String(e)));
+}
+
+function listenForReplyResults() {
+  try {
+    const listen = window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+    if (typeof listen !== "function") return;
+    listen("reply-result", (event) => {
+      const payload = event && event.payload;
+      if (!payload) return;
+      onPushedReplyResult(payload);
+    }).catch(() => {});
+  } catch (e) {
+    // Self-test still has to render if the event API is missing.
+  }
+}
+
+function openReply(phone, id) {
+  const state = noteReplyState(phone, id);
+  clearTimeout(state.sentTimer);
+  state.sentTimer = null;
+  state.sentUntil = 0;
+  state.open = true;
+  state.error = "";
+  if (lastLink) renderLink(lastLink);
+  const input = findReplyInput(noteKey(phone, id));
+  if (input) input.focus();
+}
+
+function cancelReply(phone, id) {
+  const state = composers.get(noteKey(phone, id));
+  if (!state) return;
+  state.open = false;
+  state.sending = false;
+  state.error = "";
+  if (lastLink) renderLink(lastLink);
+}
+
+async function submitReply(phone, id) {
+  const key = noteKey(phone, id);
+  const state = noteReplyState(phone, id);
+  if (state.sending) return;
+  const input = findReplyInput(key);
+  if (input) state.draft = input.value;
+  const text = state.draft.trim();
+  if (!text) {
+    state.error = "reply is empty";
+    state.open = true;
+    if (lastLink) renderLink(lastLink);
+    return;
+  }
+  if ([...text].length > MAX_REPLY_CHARS) {
+    state.error = "reply is too long";
+    state.open = true;
+    if (lastLink) renderLink(lastLink);
+    return;
+  }
+  state.draft = text;
+  state.sending = true;
+  state.error = "";
+  if (lastLink) renderLink(lastLink);
+  try {
+    await invoke("reply_notification", { phone, id, text });
+    // reply_result is pushed on "reply-result" and stored on link_status.
+    // Do not give up after a few seconds of polling: a late result still applies.
+  } catch (e) {
+    state.sending = false;
+    state.error = String(e);
+    state.open = true;
+    if (lastLink) renderLink(lastLink);
+    const again = findReplyInput(key);
+    if (again) again.focus();
+  }
+}
+
+function replyControls(n) {
+  const key = noteKey(n.phone, n.id);
+  const state = composers.get(key);
+  if (state && state.sentUntil > Date.now()) {
+    return el("div", { className: "reply-sent", textContent: "Sent" });
+  }
+  if (state && state.sentUntil) state.sentUntil = 0;
+  const onKey = (e) => {
+    if (e.key === "Enter" && e.target.classList && e.target.classList.contains("reply-text")) {
+      e.preventDefault();
+      submitReply(n.phone, n.id);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelReply(n.phone, n.id);
+    }
+  };
+  if (state && state.open) {
+    const input = el("input", {
+      type: "text",
+      className: "reply-text",
+      value: state.draft,
+      placeholder: "Reply",
+    });
+    input.readOnly = !!state.sending;
+    input.autocomplete = "off";
+    input.dataset.replyFor = key;
+    input.setAttribute("aria-label", "Reply");
+    input.addEventListener("input", () => {
+      const cur = composers.get(key);
+      if (cur) cur.draft = input.value;
+    });
+    const send = el("button", {
+      type: "button",
+      className: "send",
+      textContent: state.sending ? "Sending\u2026" : "Send",
+      disabled: !!state.sending,
+    });
+    send.addEventListener("click", () => submitReply(n.phone, n.id));
+    const row = el("div", { className: "reply" }, input, send);
+    row.addEventListener("keydown", onKey);
+    if (state.error) {
+      return el(
+        "div",
+        { className: "reply-wrap" },
+        row,
+        el("div", { className: "reply-error", textContent: state.error }),
+      );
+    }
+    return row;
+  }
+  const btn = el("button", { type: "button", className: "reply-btn", textContent: "Reply" });
+  btn.addEventListener("click", () => openReply(n.phone, n.id));
+  if (state && state.error) {
+    return el(
+      "div",
+      { className: "reply-wrap" },
+      btn,
+      el("div", { className: "reply-error", textContent: state.error }),
+    );
+  }
+  return btn;
+}
+
 function renderLink(link) {
+  lastLink = link;
+  const liveNotes = new Set(link.notifications.map((n) => noteKey(n.phone, n.id)));
+  for (const [key, state] of composers) {
+    if (!liveNotes.has(key)) {
+      clearTimeout(state.sentTimer);
+      composers.delete(key);
+    }
+  }
   const list = document.getElementById("linked");
   list.replaceChildren(
     ...link.phones.map((p) => {
@@ -116,6 +379,8 @@ function renderLink(link) {
   );
   document.getElementById("linked-empty").hidden = link.phones.length > 0;
 
+  const focusedReply = captureReplyFocus();
+  for (const n of link.notifications) absorbStatusReply(n);
   const notes = document.getElementById("notifications");
   notes.replaceChildren(
     ...link.notifications.slice(0, 20).map((n) => {
@@ -154,11 +419,13 @@ function renderLink(link) {
           el("div", { className: "app", textContent: `${n.app_name || n.app} · ${new Date(n.time).toLocaleTimeString()}` }),
           n.title ? el("div", { className: "title", textContent: n.title }) : "",
           n.text ? el("div", { className: "text", textContent: n.text }) : "",
+          n.replyable ? replyControls(n) : "",
         ),
         dismiss,
       );
     }),
   );
+  restoreReplyFocus(focusedReply);
   document.getElementById("notif-empty").hidden = link.notifications.length > 0;
   showLinkError(link.error);
   if (link.error) showLinkConfirm(null);
@@ -265,6 +532,7 @@ async function waitForLink() {
 
 (async () => {
   try {
+    listenForReplyResults();
     const status = await refresh();
     const link = await waitForLink();
     const rendered = document.querySelectorAll("#tools li").length === 2 && !!document.getElementById("pair-btn");

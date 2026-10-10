@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Largest accepted frame (one JSON line), in bytes.
 pub const MAX_FRAME: usize = 1024 * 1024;
+/// Longest notification reply, in Unicode scalar values (not bytes).
+pub const MAX_REPLY_CHARS: usize = 5_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -27,6 +29,9 @@ pub struct PhoneNotification {
     pub text: String,
     #[serde(default)]
     pub time: i64,
+    /// Inline reply is available. Missing on the wire means false.
+    #[serde(default)]
+    pub replyable: bool,
 }
 
 /// One protocol frame.
@@ -64,6 +69,18 @@ pub enum Message {
     Clipboard {
         text: String,
     },
+    /// Desktop → phone: fill this notification's inline reply field.
+    Reply {
+        id: String,
+        text: String,
+    },
+    /// Phone → desktop: the inline reply succeeded or failed.
+    ReplyResult {
+        id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     Ping,
     Pong,
     /// Any message type this build doesn't know. Ignored, so newer phones still work.
@@ -81,6 +98,20 @@ impl Message {
     pub fn from_line(line: &str) -> Result<Self, String> {
         serde_json::from_str(line.trim()).map_err(|e| format!("bad message: {e}"))
     }
+}
+
+/// Trim a notification reply and reject empty or over-long text.
+///
+/// The limit is [`MAX_REPLY_CHARS`] characters after trimming, not bytes.
+pub fn normalize_reply_text(text: &str) -> Result<String, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("reply is empty");
+    }
+    if text.chars().count() > MAX_REPLY_CHARS {
+        return Err("reply is too long");
+    }
+    Ok(text.to_string())
 }
 
 /// The phone's proof that it holds the pairing key:
@@ -292,6 +323,7 @@ mod tests {
                 title: "Anna".into(),
                 text: "Hei!".into(),
                 time: 1_760_000_000_000,
+                replyable: false,
             }),
             Message::Battery {
                 level: 82,
@@ -313,5 +345,123 @@ mod tests {
             Message::Ping
         );
         assert!(Message::from_line("not json").is_err());
+    }
+
+    #[test]
+    fn reply_round_trip_and_replyable_defaults_to_false() {
+        let reply = Message::Reply {
+            id: "0|com.whatsapp|9".into(),
+            text: "Ja, kl 18".into(),
+        };
+        assert_eq!(
+            reply.to_line(),
+            r#"{"type":"reply","id":"0|com.whatsapp|9","text":"Ja, kl 18"}"#,
+        );
+        assert_eq!(Message::from_line(&reply.to_line()).unwrap(), reply);
+
+        let ok = Message::ReplyResult {
+            id: "0|com.whatsapp|9".into(),
+            ok: true,
+            error: None,
+        };
+        assert_eq!(
+            ok.to_line(),
+            r#"{"type":"reply_result","id":"0|com.whatsapp|9","ok":true}"#,
+        );
+        assert_eq!(Message::from_line(&ok.to_line()).unwrap(), ok);
+        assert_eq!(
+            Message::from_line(r#"{"type":"reply_result","id":"k","ok":true}"#).unwrap(),
+            Message::ReplyResult {
+                id: "k".into(),
+                ok: true,
+                error: None,
+            }
+        );
+
+        let err = Message::ReplyResult {
+            id: "k".into(),
+            ok: false,
+            error: Some("notification is gone".into()),
+        };
+        assert_eq!(
+            err.to_line(),
+            r#"{"type":"reply_result","id":"k","ok":false,"error":"notification is gone"}"#,
+        );
+        assert_eq!(Message::from_line(&err.to_line()).unwrap(), err);
+        assert_eq!(
+            Message::from_line(r#"{"type":"reply_result","id":"k","ok":false}"#).unwrap(),
+            Message::ReplyResult {
+                id: "k".into(),
+                ok: false,
+                error: None,
+            }
+        );
+
+        match Message::from_line(r#"{"type":"notification","id":"n1","title":"Hi"}"#).unwrap() {
+            Message::Notification(n) => {
+                assert!(!n.replyable);
+                assert_eq!(n.id, "n1");
+                assert_eq!(n.title, "Hi");
+                assert_eq!(n.app, "");
+                assert_eq!(n.time, 0);
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
+        let without = Message::from_line(r#"{"type":"notification","id":"n1"}"#).unwrap();
+        assert!(without.to_line().contains("\"replyable\":false"));
+
+        let with_flag = Message::Notification(PhoneNotification {
+            id: "n2".into(),
+            app: String::new(),
+            app_name: String::new(),
+            title: String::new(),
+            text: "Hei".into(),
+            time: 0,
+            replyable: true,
+        });
+        assert_eq!(Message::from_line(&with_flag.to_line()).unwrap(), with_flag);
+        assert!(with_flag.to_line().contains("\"replyable\":true"));
+        match Message::from_line(
+            r#"{"type":"notification","id":"n2","replyable":true,"text":"Hei"}"#,
+        )
+        .unwrap()
+        {
+            Message::Notification(n) => {
+                assert!(n.replyable);
+                assert_eq!(n.text, "Hei");
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reply_text_is_trimmed_and_limited_to_5000_chars() {
+        assert_eq!(MAX_REPLY_CHARS, 5_000);
+        assert_eq!(normalize_reply_text("  hei  ").unwrap(), "hei");
+        assert_eq!(normalize_reply_text("\n\tok\t\n").unwrap(), "ok");
+        assert_eq!(normalize_reply_text("   ").unwrap_err(), "reply is empty");
+        assert_eq!(normalize_reply_text("").unwrap_err(), "reply is empty");
+
+        let exact = "å".repeat(5_000);
+        assert_eq!(
+            normalize_reply_text(&format!("  {exact}  ")).unwrap(),
+            exact
+        );
+        assert_eq!(
+            normalize_reply_text(&format!("{exact}!")).unwrap_err(),
+            "reply is too long"
+        );
+        // The limit is characters, not bytes: '你' is one character and three bytes.
+        assert_eq!(
+            normalize_reply_text(&"你".repeat(5_000))
+                .unwrap()
+                .chars()
+                .count(),
+            5_000
+        );
+        assert_eq!(
+            normalize_reply_text(&"你".repeat(5_001)).unwrap_err(),
+            "reply is too long"
+        );
     }
 }

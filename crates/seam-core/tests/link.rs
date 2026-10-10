@@ -67,6 +67,7 @@ async fn phone_pairs_sends_notification_and_battery_then_reconnects() {
         title: "Anna".into(),
         text: "Middag kl 18?".into(),
         time: 1_760_000_000_000,
+        replyable: false,
     };
     phone.send(&Message::Notification(n.clone())).await.unwrap();
     assert_eq!(
@@ -230,4 +231,82 @@ async fn desktop_can_send_to_a_connected_phone_and_receive_clipboard() {
         LinkEvent::Disconnected { .. }
     ) {}
     assert!(server.connected().is_empty());
+}
+
+#[tokio::test]
+async fn desktop_reply_reaches_the_phone_as_the_exact_frame() {
+    let (server, mut events, port) = start("reply").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    let n = PhoneNotification {
+        id: "0|com.whatsapp|9".into(),
+        app: "com.whatsapp".into(),
+        app_name: "WhatsApp".into(),
+        title: "Anna".into(),
+        text: "Middag?".into(),
+        time: 1_760_000_000_000,
+        replyable: true,
+    };
+    phone.send(&Message::Notification(n.clone())).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Notification {
+            device_id: "phone-1".into(),
+            notification: n.clone(),
+        }
+    );
+
+    let reply = Message::Reply {
+        id: n.id.clone(),
+        text: "Ja, kl 18".into(),
+    };
+    assert!(server.send_to("phone-1", reply.clone()));
+    let got = tokio::time::timeout(Duration::from_secs(5), phone.recv())
+        .await
+        .expect("timed out waiting for the reply frame")
+        .expect("phone connection closed before the reply");
+    assert_eq!(
+        got.to_line(),
+        r#"{"type":"reply","id":"0|com.whatsapp|9","text":"Ja, kl 18"}"#,
+    );
+    assert_eq!(got, reply);
+
+    phone
+        .send(&Message::ReplyResult {
+            id: n.id.clone(),
+            ok: true,
+            error: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::ReplyResult {
+            device_id: "phone-1".into(),
+            id: n.id.clone(),
+            ok: true,
+            error: None,
+        }
+    );
+    phone
+        .send(&Message::ReplyResult {
+            id: n.id.clone(),
+            ok: false,
+            error: Some("notification is gone".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::ReplyResult {
+            device_id: "phone-1".into(),
+            id: n.id,
+            ok: false,
+            error: Some("notification is gone".into()),
+        }
+    );
 }
