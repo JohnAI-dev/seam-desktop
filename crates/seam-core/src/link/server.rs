@@ -62,6 +62,13 @@ pub enum LinkEvent {
         ok: bool,
         error: Option<String>,
     },
+    /// Phone reported a call. `ringing` shows the banner; `active` and `ended` hide it.
+    Call {
+        device_id: String,
+        state: protocol::CallState,
+        number: String,
+        name: String,
+    },
 }
 
 struct Pending {
@@ -357,6 +364,12 @@ impl LinkServer {
                             id: nid,
                             ok,
                             error,
+                        }),
+                        Message::Call { state, number, name } => Some(LinkEvent::Call {
+                            device_id: id,
+                            state,
+                            number,
+                            name,
                         }),
                         Message::Pong => { missed_pongs = 0; None }
                         Message::Ping => { send(writer, &Message::Pong).await?; None }

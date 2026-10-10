@@ -1,5 +1,5 @@
 //! The phone link inside the app: runs the server, keeps what the window shows,
-//! and turns phone notifications into notifications on this computer.
+//! and turns phone notifications and incoming calls into notifications on this computer.
 
 use seam_core::link::{self, LinkEvent, LinkServer, Message, PhoneNotification};
 use serde::Serialize;
@@ -54,6 +54,18 @@ struct ReplyResultPush {
     seq: u64,
 }
 
+/// A ringing call the window shows as a banner.
+///
+/// `caller` is the contact name, or the number, or "Unknown caller".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallView {
+    phone: String,
+    state: String,
+    number: String,
+    name: String,
+    caller: String,
+}
+
 #[derive(Serialize)]
 pub struct LinkStatus {
     running: bool,
@@ -61,6 +73,8 @@ pub struct LinkStatus {
     error: Option<String>,
     phones: Vec<PhoneView>,
     notifications: Vec<NotificationView>,
+    /// Ringing call to show, or null when the banner should be hidden.
+    call: Option<CallView>,
 }
 
 #[derive(Serialize)]
@@ -78,6 +92,8 @@ struct Shared {
     notifications: VecDeque<NotificationView>,
     /// Monotonic so a replaced notification row cannot reuse a reply_result id.
     next_reply_seq: u64,
+    /// Ringing call shown in the window, if any.
+    call: Option<CallView>,
 }
 
 impl Shared {
@@ -119,6 +135,48 @@ impl Shared {
         };
         Some(seq)
     }
+
+    /// Apply a phone call update.
+    ///
+    /// Ringing replaces the banner and returns the label to notify with.
+    /// Active and ended from the same phone hide it. Another phone's call is left
+    /// alone, and an unknown state changes nothing.
+    fn apply_call(
+        &mut self,
+        phone: &str,
+        state: link::protocol::CallState,
+        number: &str,
+        name: &str,
+    ) -> Option<String> {
+        match state {
+            link::protocol::CallState::Ringing => {
+                let caller = link::protocol::caller_label(name, number);
+                self.call = Some(CallView {
+                    phone: phone.to_string(),
+                    state: "ringing".to_string(),
+                    number: number.to_string(),
+                    name: name.to_string(),
+                    caller: caller.clone(),
+                });
+                Some(caller)
+            }
+            link::protocol::CallState::Active | link::protocol::CallState::Ended => {
+                self.clear_call(phone);
+                None
+            }
+            link::protocol::CallState::Unknown => None,
+        }
+    }
+
+    /// Drop the banner if it belongs to `phone`. Returns whether it was showing.
+    fn clear_call(&mut self, phone: &str) -> bool {
+        if self.call.as_ref().is_some_and(|c| c.phone == phone) {
+            self.call = None;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn reply_error_text(error: Option<String>) -> String {
@@ -145,6 +203,7 @@ impl Link {
             error: s.error.clone(),
             phones,
             notifications: s.notifications.iter().cloned().collect(),
+            call: s.call.clone(),
         }
     }
 
@@ -178,6 +237,7 @@ impl Link {
         let mut s = self.shared.lock().unwrap();
         s.phones.remove(id);
         s.notifications.retain(|n| n.phone != id);
+        s.clear_call(id);
         Ok(())
     }
 
@@ -220,6 +280,37 @@ impl Link {
                 text,
             },
         ) {
+            Ok(())
+        } else {
+            Err("this phone is not connected".into())
+        }
+    }
+
+    /// Decline or silence the ringing call from `phone`.
+    ///
+    /// `action` is `decline` or `silence`. Sends a `call_action` frame. The banner
+    /// stays until the phone reports `active` or `ended`.
+    pub fn call_action(&self, phone: &str, action: &str) -> Result<(), String> {
+        let kind = match action {
+            "decline" => link::protocol::CallActionKind::Decline,
+            "silence" => link::protocol::CallActionKind::Silence,
+            _ => return Err("unknown call action".into()),
+        };
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        let ringing = self
+            .shared
+            .lock()
+            .unwrap()
+            .call
+            .as_ref()
+            .is_some_and(|c| c.phone == phone && c.state == "ringing");
+        if !ringing {
+            return Err("there is no ringing call".into());
+        }
+        if server.send_to(phone, Message::CallAction { action: kind }) {
             Ok(())
         } else {
             Err("this phone is not connected".into())
@@ -442,6 +533,8 @@ fn handle_event(
 ) {
     let mut show: Option<PhoneNotification> = None;
     let mut reply_push: Option<ReplyResultPush> = None;
+    let mut notify_caller: Option<String> = None;
+    let mut call_changed = false;
     {
         let mut s = shared.lock().unwrap();
         match event {
@@ -459,6 +552,7 @@ fn handle_event(
                 if let Some(p) = s.phones.get_mut(&device_id) {
                     p.connected = false;
                 }
+                call_changed = s.clear_call(&device_id);
             }
             LinkEvent::Battery {
                 device_id,
@@ -493,6 +587,15 @@ fn handle_event(
                 // runs while `shared` is locked, and the main thread may need it.
                 // Failure is ignored: headless CI has no clipboard.
                 set_system_clipboard(app, text);
+            }
+            LinkEvent::Call {
+                device_id,
+                state,
+                number,
+                name,
+            } => {
+                notify_caller = s.apply_call(&device_id, state, &number, &name);
+                call_changed = true;
             }
             LinkEvent::ReplyResult {
                 device_id,
@@ -537,11 +640,25 @@ fn handle_event(
             .body(n.text)
             .show();
     }
+    if call_changed {
+        // Polling is every 2s; push so a ringing banner appears, and active/ended hides it, now.
+        let _ = app.emit("incoming-call", ());
+    }
+    if let (Some(caller), true) = (notify_caller, system_notifications) {
+        // Headless machines have no notification service; that's fine.
+        let _ = app
+            .notification()
+            .builder()
+            .title("Incoming call")
+            .body(caller)
+            .show();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Link, NotificationView, Shared};
+    use seam_core::link::protocol::CallState;
     use seam_core::link::{LinkServer, PhoneNotification};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -861,6 +978,176 @@ mod tests {
                 .unwrap_err(),
             "this phone is not connected"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ringing_banner_uses_name_or_number_or_unknown_caller() {
+        let link = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert!(serde_json::to_value(link.status()).unwrap()["call"].is_null());
+
+        {
+            let mut shared = link.shared.lock().unwrap();
+            assert_eq!(
+                shared
+                    .apply_call("phone-a", CallState::Ringing, "+47123", "Anna")
+                    .as_deref(),
+                Some("Anna")
+            );
+        }
+        let call = &serde_json::to_value(link.status()).unwrap()["call"];
+        assert_eq!(call["phone"].as_str(), Some("phone-a"));
+        assert_eq!(call["state"].as_str(), Some("ringing"));
+        assert_eq!(call["number"].as_str(), Some("+47123"));
+        assert_eq!(call["name"].as_str(), Some("Anna"));
+        assert_eq!(call["caller"].as_str(), Some("Anna"));
+
+        {
+            let mut shared = link.shared.lock().unwrap();
+            assert_eq!(
+                shared
+                    .apply_call("phone-a", CallState::Ringing, "+47 00", "  ")
+                    .as_deref(),
+                Some("+47 00")
+            );
+            assert_eq!(
+                shared
+                    .apply_call("phone-a", CallState::Ringing, " \t", "   ")
+                    .as_deref(),
+                Some("Unknown caller")
+            );
+        }
+        assert_eq!(
+            link.status().call.as_ref().map(|c| c.caller.as_str()),
+            Some("Unknown caller")
+        );
+    }
+
+    #[test]
+    fn active_or_ended_hides_only_that_phones_banner() {
+        let mut shared = Shared::default();
+        shared.apply_call("phone-a", CallState::Ringing, "", "Anna");
+        shared.apply_call("phone-b", CallState::Ringing, "555", "");
+        assert_eq!(
+            shared.call.as_ref().map(|c| c.phone.as_str()),
+            Some("phone-b")
+        );
+        assert_eq!(shared.call.as_ref().map(|c| c.caller.as_str()), Some("555"));
+
+        // Ending a different phone, or an unknown state, leaves the banner up.
+        assert!(shared
+            .apply_call("phone-a", CallState::Ended, "", "")
+            .is_none());
+        assert_eq!(
+            shared.call.as_ref().map(|c| c.phone.as_str()),
+            Some("phone-b")
+        );
+        assert!(shared
+            .apply_call("phone-b", CallState::Unknown, "1", "Other")
+            .is_none());
+        assert_eq!(shared.call.as_ref().map(|c| c.caller.as_str()), Some("555"));
+        assert!(!shared.clear_call("phone-a"));
+
+        assert!(shared
+            .apply_call("phone-b", CallState::Active, "555", "")
+            .is_none());
+        assert!(shared.call.is_none());
+
+        shared.apply_call("phone-a", CallState::Ringing, "", "");
+        assert_eq!(
+            shared.call.as_ref().map(|c| c.caller.as_str()),
+            Some("Unknown caller")
+        );
+        assert!(shared.clear_call("phone-a"));
+        assert!(shared.call.is_none());
+        assert!(shared
+            .apply_call("phone-a", CallState::Ended, "", "")
+            .is_none());
+        assert!(shared.call.is_none());
+    }
+
+    #[test]
+    fn call_action_checks_the_action_and_the_ringing_call() {
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            offline.call_action("phone-a", "hangup").unwrap_err(),
+            "unknown call action"
+        );
+        assert_eq!(
+            offline.call_action("phone-a", "decline").unwrap_err(),
+            "the phone link is not running"
+        );
+
+        let dir = std::env::temp_dir().join(format!("seam-call-action-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Test Desktop".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            link.call_action("phone-a", "silence").unwrap_err(),
+            "there is no ringing call"
+        );
+        link.shared
+            .lock()
+            .unwrap()
+            .apply_call("phone-a", CallState::Ringing, "+47123", "Anna");
+        assert_eq!(
+            link.call_action("phone-b", "decline").unwrap_err(),
+            "there is no ringing call"
+        );
+        assert_eq!(
+            link.call_action("phone-a", "decline").unwrap_err(),
+            "this phone is not connected"
+        );
+        assert_eq!(
+            link.call_action("phone-a", "silence").unwrap_err(),
+            "this phone is not connected"
+        );
+        // A failed send must not hide the banner; only active/ended do.
+        assert_eq!(
+            link.status().call.as_ref().map(|c| c.state.as_str()),
+            Some("ringing")
+        );
+        assert_eq!(
+            link.status().call.as_ref().map(|c| c.caller.as_str()),
+            Some("Anna")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_hides_only_that_phones_ringing_call() {
+        let dir = std::env::temp_dir().join(format!("seam-call-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Test Desktop".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.apply_call("phone-a", CallState::Ringing, "", "Anna");
+            shared.apply_call("phone-b", CallState::Ringing, "555", "");
+        }
+        assert_eq!(
+            link.status().call.as_ref().map(|c| c.phone.as_str()),
+            Some("phone-b")
+        );
+        link.forget("phone-a").unwrap();
+        assert_eq!(
+            link.status().call.as_ref().map(|c| c.phone.as_str()),
+            Some("phone-b")
+        );
+        link.forget("phone-b").unwrap();
+        assert!(link.status().call.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

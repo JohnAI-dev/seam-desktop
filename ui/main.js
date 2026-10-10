@@ -204,6 +204,18 @@ function listenForReplyResults() {
   }
 }
 
+function listenForIncomingCalls() {
+  try {
+    const listen = window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+    if (typeof listen !== "function") return;
+    listen("incoming-call", () => {
+      refreshLink().catch((e) => showLinkError(String(e)));
+    }).catch(() => {});
+  } catch (e) {
+    // Polling still updates the banner.
+  }
+}
+
 function openReply(phone, id) {
   const state = noteReplyState(phone, id);
   clearTimeout(state.sentTimer);
@@ -325,8 +337,23 @@ function replyControls(n) {
   return btn;
 }
 
+function renderCall(call) {
+  const box = document.getElementById("call");
+  if (!box) return;
+  const caller = document.getElementById("call-caller");
+  if (!call || call.state !== "ringing" || typeof call.phone !== "string" || !call.phone) {
+    box.hidden = true;
+    delete box.dataset.phone;
+    return;
+  }
+  if (caller) caller.textContent = call.caller || "Unknown caller";
+  box.dataset.phone = call.phone;
+  box.hidden = false;
+}
+
 function renderLink(link) {
   lastLink = link;
+  renderCall(link.call);
   const liveNotes = new Set(link.notifications.map((n) => noteKey(n.phone, n.id)));
   for (const [key, state] of composers) {
     if (!liveNotes.has(key)) {
@@ -470,9 +497,31 @@ document.getElementById("pair-btn").addEventListener("click", async () => {
 });
 document.getElementById("pair-done").addEventListener("click", hidePairing);
 
+async function sendCallAction(action) {
+  const box = document.getElementById("call");
+  const phone = box && box.dataset.phone;
+  if (!phone) return;
+  const buttons = box.querySelectorAll("button");
+  for (const b of buttons) b.disabled = true;
+  try {
+    await invoke("call_action", { phone, action });
+    showLinkError(null);
+  } catch (e) {
+    showLinkError(String(e));
+  } finally {
+    for (const b of buttons) b.disabled = false;
+  }
+}
+document.getElementById("call-decline").addEventListener("click", () => sendCallAction("decline"));
+document.getElementById("call-silence").addEventListener("click", () => sendCallAction("silence"));
+
 let knownPhones = null;
+let linkRefreshEpoch = 0;
 async function refreshLink() {
+  const epoch = ++linkRefreshEpoch;
   const link = await invoke("link_status");
+  // A slow read must not hide a banner a newer refresh already showed.
+  if (epoch !== linkRefreshEpoch) return link;
   // Close the QR code automatically when a new phone finishes pairing.
   const ids = link.phones.map((p) => p.id).join(",");
   if (knownPhones !== null && ids !== knownPhones && link.phones.length > knownPhones.split(",").filter(Boolean).length) hidePairing();
@@ -533,6 +582,7 @@ async function waitForLink() {
 (async () => {
   try {
     listenForReplyResults();
+    listenForIncomingCalls();
     const status = await refresh();
     const link = await waitForLink();
     const rendered = document.querySelectorAll("#tools li").length === 2 && !!document.getElementById("pair-btn");
