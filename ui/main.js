@@ -776,6 +776,106 @@ document.getElementById("pair-btn").addEventListener("click", async () => {
   }
 });
 document.getElementById("pair-done").addEventListener("click", hidePairing);
+
+function showWirelessError(msg) {
+  const e = document.getElementById("wireless-error");
+  if (!e) return;
+  e.textContent = msg || "";
+  e.hidden = !msg;
+}
+
+function showWirelessConfirm(msg) {
+  const e = document.getElementById("wireless-confirm");
+  if (!e) return;
+  e.textContent = msg || "";
+  e.hidden = !msg;
+}
+
+function renderWireless(w) {
+  const box = document.getElementById("wireless");
+  const qr = document.getElementById("wireless-qr");
+  const btn = document.getElementById("wireless-btn");
+  const status = document.getElementById("wireless-status");
+  if (!box || !qr || !w) return;
+  if (w.active && w.qr_svg) {
+    if (qr.dataset.svg !== w.qr_svg) {
+      qr.innerHTML = w.qr_svg;
+      qr.dataset.svg = w.qr_svg;
+    }
+    box.hidden = false;
+    if (status) status.textContent = w.message || "Waiting for the phone to scan the QR code...";
+    if (btn) btn.disabled = true;
+  } else {
+    box.hidden = true;
+    if (qr.dataset.svg) {
+      qr.replaceChildren();
+      delete qr.dataset.svg;
+    }
+    if (btn) btn.disabled = false;
+  }
+  showWirelessError(w.error);
+  if (w.active || w.error || !w.message) {
+    showWirelessConfirm(null);
+    return;
+  }
+  const confirm = document.getElementById("wireless-confirm");
+  if (confirm && confirm.textContent !== w.message) {
+    showWirelessConfirm(w.message);
+    refresh().catch((e) => showError(String(e)));
+  }
+}
+
+async function refreshWireless() {
+  const w = await invoke("wireless_status");
+  renderWireless(w);
+}
+
+function listenForWireless() {
+  try {
+    const listen = window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+    if (typeof listen !== "function") return;
+    listen("wireless-pairing", () => {
+      refreshWireless().catch((e) => showWirelessError(String(e)));
+    }).catch(() => {});
+  } catch (e) {
+    // Polling still updates the QR panel.
+  }
+}
+
+document.getElementById("wireless-btn").addEventListener("click", async () => {
+  const btn = document.getElementById("wireless-btn");
+  btn.disabled = true;
+  showWirelessError(null);
+  showWirelessConfirm(null);
+  try {
+    const pairing = await invoke("start_wireless_pairing");
+    const expiry = document.getElementById("wireless-expiry");
+    if (expiry && pairing.expires_in_secs) {
+      expiry.textContent = String(Math.max(1, Math.round(pairing.expires_in_secs / 60)));
+    }
+    renderWireless({
+      active: true,
+      qr_svg: pairing.qr_svg,
+      message: "Waiting for the phone to scan the QR code...",
+      error: null,
+      paired: false,
+    });
+  } catch (e) {
+    showWirelessError(String(e));
+    btn.disabled = false;
+  }
+});
+
+document.getElementById("wireless-cancel").addEventListener("click", async () => {
+  try {
+    await invoke("cancel_wireless_pairing");
+  } catch (e) {
+    showWirelessError(String(e));
+    return;
+  }
+  renderWireless({ active: false, qr_svg: null, message: null, error: null, paired: false });
+});
+
 const dropAskCancel = document.getElementById("drop-ask-cancel");
 if (dropAskCancel) dropAskCancel.addEventListener("click", hideDropAsk);
 
@@ -814,6 +914,7 @@ async function refreshLink() {
 
 async function refresh() {
   refreshLink().catch((e) => showLinkError(String(e)));
+  await refreshWireless().catch((e) => showWirelessError(String(e)));
   const status = await invoke("status");
   renderDevices(status);
   renderTools(status);
@@ -866,6 +967,7 @@ async function waitForLink() {
     listenForReplyResults();
     listenForIncomingCalls();
     listenForFileTransfers();
+    listenForWireless();
     const status = await refresh();
     const link = await waitForLink();
     const rendered = document.querySelectorAll("#tools li").length === 2 && !!document.getElementById("pair-btn");
