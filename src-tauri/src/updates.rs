@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 /// How often to look for a new version while the app is running.
@@ -98,6 +99,13 @@ async fn check_and_download(app: &AppHandle) {
         Ok(Some((update, bytes))) => {
             let version = update.version.clone();
             *updates.pending.lock().unwrap() = Some(Pending { update, bytes });
+            // Tell the person even if the window is in the background.
+            let _ = app
+                .notification()
+                .builder()
+                .title("Seam update ready")
+                .body(ready_message(&version))
+                .show();
             UpdateStatus::Ready { current, version }
         }
         Ok(None) => UpdateStatus::UpToDate { current },
@@ -107,6 +115,11 @@ async fn check_and_download(app: &AppHandle) {
         }
     };
     *updates.status.lock().unwrap() = Some(status);
+}
+
+/// The text shown when a new version has been downloaded.
+pub fn ready_message(version: &str) -> String {
+    format!("Seam {version} is ready. Restart Seam to update.")
 }
 
 /// Install the downloaded update and restart into it.
@@ -140,6 +153,11 @@ mod tests {
         assert_eq!(v["state"], "ready");
         assert_eq!(v["version"], "0.1.42");
         assert_eq!(v["current"], "0.1.40");
+
+        assert_eq!(
+            ready_message("0.1.42"),
+            "Seam 0.1.42 is ready. Restart Seam to update."
+        );
 
         let idle = Updates::default().status("0.1.40");
         assert_eq!(serde_json::to_value(&idle).unwrap()["state"], "up_to_date");

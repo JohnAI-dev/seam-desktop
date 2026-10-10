@@ -1,3 +1,6 @@
+/* Elements with the hidden attribute stay hidden even if a class sets display. */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #f7f7f5; --fg: #1b1b1a; --muted: #6b6b66; --card: #ffffff; --line: #e4e4df;
   --accent: #2f5bea; --accent-fg: #ffffff; --ok: #1f8a4c; --warn: #b26a00; --bad: #c0392b;
