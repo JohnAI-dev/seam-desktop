@@ -605,7 +605,7 @@ async function refreshUpdate() {
   const u = await invoke("update_status");
   const box = document.getElementById("update");
   if (u.state === "ready") {
-    document.getElementById("update-text").textContent = `Seam ${u.version} is ready.`;
+    document.getElementById("update-text").textContent = `Seam ${u.version} is ready. Restart Seam to update.`;
     box.hidden = false;
   } else {
     box.hidden = true;
