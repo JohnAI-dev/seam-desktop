@@ -5,7 +5,10 @@ use seam_core::link::{self, LinkEvent, LinkServer, Message, PhoneNotification};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
@@ -13,6 +16,15 @@ use tauri_plugin_notification::NotificationExt;
 const PORTS: std::ops::RangeInclusive<u16> = 47100..=47109;
 /// How many recent phone notifications the window keeps.
 const KEEP_NOTIFICATIONS: usize = 50;
+/// Recent outbound file transfers kept in the window, newest first.
+const KEEP_SENDS: usize = 20;
+/// Received files kept in the window, newest first.
+const KEEP_RECEIVED: usize = 50;
+const SEND_SENDING: &str = "sending";
+const SEND_DONE: &str = "done";
+const SEND_FAILED: &str = "failed";
+/// ShowItems must answer quickly; otherwise Show in folder opens the folder instead.
+const DBUS_REPLY_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Serialize, Clone)]
 pub struct PhoneView {
@@ -66,6 +78,54 @@ pub struct CallView {
     caller: String,
 }
 
+/// One outbound file, shown with progress, Cancel, and the result.
+#[derive(Debug, Clone, Serialize)]
+struct SendView {
+    phone: String,
+    transfer: String,
+    name: String,
+    sent: u64,
+    size: u64,
+    /// `sending`, `done`, or `failed`.
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// A file saved from a phone.
+#[derive(Debug, Clone, Serialize)]
+struct ReceivedFileView {
+    phone: String,
+    phone_name: String,
+    name: String,
+    path: String,
+}
+
+/// One connected phone the window can offer as a drop target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DropPhone {
+    pub id: String,
+    pub name: String,
+}
+
+/// What to do with files dropped on the window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DropPlan {
+    Error {
+        message: String,
+    },
+    /// Sent to the only connected phone (its display name).
+    Sent {
+        phone: String,
+    },
+    /// Several phones are connected; the window must ask. `paths` are real files only.
+    Ask {
+        phones: Vec<DropPhone>,
+        paths: Vec<String>,
+    },
+}
+
 #[derive(Serialize)]
 pub struct LinkStatus {
     running: bool,
@@ -77,6 +137,10 @@ pub struct LinkStatus {
     call: Option<CallView>,
     /// How long the Ring button stays on Stop, in seconds.
     ring_secs: u64,
+    /// Outbound file transfers, newest first.
+    sends: Vec<SendView>,
+    /// Files received from phones, newest first.
+    received: Vec<ReceivedFileView>,
 }
 
 #[derive(Serialize)]
@@ -96,6 +160,12 @@ struct Shared {
     next_reply_seq: u64,
     /// Ringing call shown in the window, if any.
     call: Option<CallView>,
+    /// Outbound transfers, newest first.
+    sends: VecDeque<SendView>,
+    /// Files saved from phones, newest first.
+    received: VecDeque<ReceivedFileView>,
+    /// Last time a send-progress refresh was pushed to the window.
+    last_transfer_emit: Option<Instant>,
 }
 
 impl Shared {
@@ -179,6 +249,100 @@ impl Shared {
             false
         }
     }
+
+    fn note_send_progress(
+        &mut self,
+        phone: &str,
+        transfer: &str,
+        name: &str,
+        sent: u64,
+        size: u64,
+    ) {
+        if let Some(row) = self.sends.iter_mut().find(|row| row.transfer == transfer) {
+            if row.state != SEND_SENDING {
+                return;
+            }
+            row.sent = sent;
+            row.size = size;
+            if !name.is_empty() {
+                row.name = name.to_string();
+            }
+            return;
+        }
+        self.sends.push_front(SendView {
+            phone: phone.to_string(),
+            transfer: transfer.to_string(),
+            name: display_file_name(name),
+            sent,
+            size,
+            state: SEND_SENDING.to_string(),
+            error: None,
+        });
+        self.sends.truncate(KEEP_SENDS);
+    }
+
+    fn note_send_finished(
+        &mut self,
+        phone: &str,
+        transfer: &str,
+        name: &str,
+        ok: bool,
+        error: Option<String>,
+    ) {
+        let state = if ok { SEND_DONE } else { SEND_FAILED };
+        let error = if ok {
+            None
+        } else {
+            Some(send_error_text(error))
+        };
+        if let Some(row) = self.sends.iter_mut().find(|row| row.transfer == transfer) {
+            if ok {
+                row.sent = row.size;
+            }
+            row.state = state.to_string();
+            row.error = error;
+            if !name.is_empty() {
+                row.name = name.to_string();
+            }
+            return;
+        }
+        self.sends.push_front(SendView {
+            phone: phone.to_string(),
+            transfer: transfer.to_string(),
+            name: display_file_name(name),
+            sent: 0,
+            size: 0,
+            state: state.to_string(),
+            error,
+        });
+        self.sends.truncate(KEEP_SENDS);
+    }
+
+    fn record_received(&mut self, phone: &str, phone_name: &str, path: &Path) -> String {
+        let name = file_label(path);
+        let notice = received_notice(&name, phone_name);
+        self.received.push_front(ReceivedFileView {
+            phone: phone.to_string(),
+            phone_name: phone_name.to_string(),
+            name,
+            path: path.to_string_lossy().into_owned(),
+        });
+        self.received.truncate(KEEP_RECEIVED);
+        notice
+    }
+
+    /// True when a progress event should refresh the window. Finished transfers always emit.
+    fn transfer_emit_due(&mut self) -> bool {
+        let now = Instant::now();
+        let due = match self.last_transfer_emit {
+            Some(then) => now.duration_since(then) >= Duration::from_millis(200),
+            None => true,
+        };
+        if due {
+            self.last_transfer_emit = Some(now);
+        }
+        due
+    }
 }
 
 fn reply_error_text(error: Option<String>) -> String {
@@ -216,6 +380,8 @@ impl Link {
             notifications: s.notifications.iter().cloned().collect(),
             call: s.call.clone(),
             ring_secs: link::protocol::RING_SECS,
+            sends: s.sends.iter().cloned().collect(),
+            received: s.received.iter().cloned().collect(),
         }
     }
 
@@ -372,6 +538,369 @@ impl Link {
         } else {
             Err("this phone is not connected".into())
         }
+    }
+
+    /// Start sending `path` to a connected phone. Returns the transfer id.
+    ///
+    /// A failure is also listed so a multi-file drop can show which file did not start.
+    pub fn send_file(&self, phone: &str, path: &str) -> Result<String, String> {
+        self.queue_send(phone, path).inspect_err(|error| {
+            if !path.is_empty() {
+                self.note_local_send_failure(phone, path, error);
+            }
+        })
+    }
+
+    fn queue_send(&self, phone: &str, path: &str) -> Result<String, String> {
+        if path.is_empty() {
+            return Err("no file chosen".into());
+        }
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        server.send_file(phone, Path::new(path))
+    }
+
+    fn note_local_send_failure(&self, phone: &str, path: &str, error: &str) {
+        let mut shared = self.shared.lock().unwrap();
+        shared.sends.push_front(SendView {
+            phone: phone.to_string(),
+            transfer: local_failure_id(),
+            name: file_label(Path::new(path)),
+            sent: 0,
+            size: 0,
+            state: SEND_FAILED.to_string(),
+            error: Some(send_error_text(Some(error.to_string()))),
+        });
+        shared.sends.truncate(KEEP_SENDS);
+    }
+
+    /// Stop an outbound transfer started by [`Self::send_file`].
+    ///
+    /// Already-finished transfers are a no-op so a late Cancel is not an error.
+    pub fn cancel_send(&self, transfer: &str) -> Result<(), String> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        if server.cancel_send(transfer) {
+            return Ok(());
+        }
+        let already_finished = self
+            .shared
+            .lock()
+            .unwrap()
+            .sends
+            .iter()
+            .any(|send| send.transfer == transfer && send.state != SEND_SENDING);
+        if already_finished {
+            Ok(())
+        } else {
+            Err("this transfer is not running".into())
+        }
+    }
+
+    /// Reveal a received file in Finder, Explorer, or the file manager.
+    ///
+    /// Only paths this session actually received are accepted.
+    pub fn reveal_received(&self, path: &str) -> Result<(), String> {
+        if path.is_empty() || !self.owns_received_path(path) {
+            return Err("unknown file".into());
+        }
+        let file = PathBuf::from(path);
+        if !file.is_file() {
+            return Err("file is gone".into());
+        }
+        reveal_path(&file)
+    }
+
+    fn owns_received_path(&self, path: &str) -> bool {
+        self.shared
+            .lock()
+            .unwrap()
+            .received
+            .iter()
+            .any(|file| file.path == path)
+    }
+
+    fn connected_phone_choices(&self) -> Vec<DropPhone> {
+        let mut phones: Vec<_> = {
+            let shared = self.shared.lock().unwrap();
+            shared
+                .phones
+                .values()
+                .filter(|phone| phone.connected)
+                .map(|phone| DropPhone {
+                    id: phone.id.clone(),
+                    name: phone.name.clone(),
+                })
+                .collect()
+        };
+        phones.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        phones
+    }
+
+    /// Send dropped files to the only connected phone, or ask when there are several.
+    ///
+    /// Directories are skipped. A drop that contains no files is reported, not sent.
+    /// If at least one file was queued, this is [`DropPlan::Sent`] even when another
+    /// file could not start. The window must not treat a partial send as a total failure.
+    pub fn deliver_drop(&self, paths: &[String]) -> Result<DropPlan, String> {
+        if paths.is_empty() || paths.iter().all(|path| path.is_empty()) {
+            return Ok(DropPlan::Error {
+                message: "no file chosen".into(),
+            });
+        }
+        let files: Vec<String> = paths
+            .iter()
+            .filter(|path| !path.is_empty() && Path::new(path).is_file())
+            .cloned()
+            .collect();
+        if files.is_empty() {
+            return Ok(DropPlan::Error {
+                message: "not a file".into(),
+            });
+        }
+        let phones = self.connected_phone_choices();
+        match phones.len() {
+            0 => Ok(DropPlan::Error {
+                message: "no phone is connected".into(),
+            }),
+            1 => {
+                let phone = &phones[0];
+                self.send_paths(&phone.id, &files)?;
+                Ok(DropPlan::Sent {
+                    phone: phone.name.clone(),
+                })
+            }
+            _ => Ok(DropPlan::Ask {
+                phones,
+                paths: files,
+            }),
+        }
+    }
+
+    fn send_paths(&self, phone: &str, paths: &[String]) -> Result<(), String> {
+        let mut started = 0usize;
+        let mut first_error = None;
+        for path in paths {
+            match self.send_file(phone, path) {
+                Ok(_) => started += 1,
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        classify_send_batch(started, first_error)
+    }
+}
+
+/// A drop succeeds when at least one file was queued. Later errors must not hide that.
+fn classify_send_batch(started: usize, first_error: Option<String>) -> Result<(), String> {
+    if started > 0 {
+        Ok(())
+    } else {
+        Err(first_error.unwrap_or_else(|| "no file chosen".to_string()))
+    }
+}
+
+fn local_failure_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("local-{n}")
+}
+
+/// Forward files dropped on the window to the UI (`files-dropped`).
+pub fn watch_drops(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let app = app.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+            let paths = dropped_path_list(paths);
+            if !paths.is_empty() {
+                let _ = app.emit("files-dropped", paths);
+            }
+        }
+    });
+}
+
+/// Paths from a Tauri drag-drop event, skipping blanks.
+fn dropped_path_list(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+fn phone_display_name(name: &str, id: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        id.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn display_file_name(name: &str) -> String {
+    if name.is_empty() {
+        "file".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty() && name != "." && name != "..")
+        .unwrap_or_else(|| "file".to_string())
+}
+
+/// System notification text: `Received <name> from <phone>`.
+fn received_notice(name: &str, phone: &str) -> String {
+    format!("Received {name} from {phone}")
+}
+
+fn send_error_text(error: Option<String>) -> String {
+    match error {
+        Some(text) if !text.trim().is_empty() => text,
+        _ => "could not send the file".to_string(),
+    }
+}
+
+fn file_uri(path: &Path) -> String {
+    let mut uri = String::from("file://");
+    for byte in path.to_string_lossy().bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                uri.push(byte as char);
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
+}
+
+fn folder_to_open(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => path,
+    }
+}
+
+fn macos_reveal_args(path: &Path) -> Vec<String> {
+    vec!["-R".to_string(), path.display().to_string()]
+}
+
+/// One raw command-line token: `/select,"<path>"`.
+///
+/// Explorer only honors `/select` when that switch is not wrapped in quotes.
+/// `Command` quotes any argument that contains a space, which hides the switch
+/// for user profiles and names like `photo (1).jpg`.
+fn windows_select_arg(path: &Path) -> String {
+    let shown = path.display().to_string().replace('"', "");
+    format!("/select,\"{shown}\"")
+}
+
+fn linux_show_items_args(uri: &str) -> Vec<String> {
+    // Quotes are part of the text dbus-send parses. An unquoted `file://` URI is
+    // split on colons, so ShowItems can exit 0 without revealing anything.
+    let uri = uri.replace('"', "%22");
+    vec![
+        "--session".to_string(),
+        "--dest=org.freedesktop.FileManager1".to_string(),
+        "--type=method_call".to_string(),
+        "--print-reply".to_string(),
+        format!("--reply-timeout={DBUS_REPLY_TIMEOUT_MS}"),
+        "/org/freedesktop/FileManager1".to_string(),
+        "org.freedesktop.FileManager1.ShowItems".to_string(),
+        format!("array:string:\"{uri}\""),
+        "string:\"\"".to_string(),
+    ]
+}
+
+fn spawn_detached(program: &str, args: &[String]) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not show the file: {e}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Explorer only honors `/select` when that switch is not wrapped in quotes.
+/// Pass the argument with `raw_arg` so the command line is `/select,"<path>"`.
+#[cfg(windows)]
+fn spawn_explorer(raw: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let mut child = Command::new("explorer")
+        .raw_arg(raw)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not show the file: {e}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_explorer(_raw: &str) -> Result<(), String> {
+    Err("could not show the file".into())
+}
+
+fn reveal_with_explorer(path: &Path) -> Result<(), String> {
+    spawn_explorer(&windows_select_arg(path))
+}
+
+fn dbus_show_items_ok(args: &[String]) -> bool {
+    let args = args.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = std::thread::Builder::new()
+        .name("seam-reveal".to_string())
+        .spawn(move || {
+            let ok = Command::new("dbus-send")
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            let _ = tx.send(ok);
+        });
+    if started.is_err() {
+        return false;
+    }
+    // A little past dbus-send's own reply timeout, so a hung bus cannot stick.
+    rx.recv_timeout(Duration::from_millis(DBUS_REPLY_TIMEOUT_MS + 500))
+        .unwrap_or(false)
+}
+
+fn reveal_on_linux(path: &Path) -> Result<(), String> {
+    let args = linux_show_items_args(&file_uri(path));
+    if dbus_show_items_ok(&args) {
+        return Ok(());
+    }
+    let dir = folder_to_open(path).to_string_lossy().into_owned();
+    spawn_detached("xdg-open", &[dir])
+}
+
+fn reveal_path(path: &Path) -> Result<(), String> {
+    match std::env::consts::OS {
+        "macos" => spawn_detached("open", &macos_reveal_args(path)),
+        "windows" => reveal_with_explorer(path),
+        _ => reveal_on_linux(path),
     }
 }
 
@@ -565,6 +1094,8 @@ fn handle_event(
     let mut reply_push: Option<ReplyResultPush> = None;
     let mut notify_caller: Option<String> = None;
     let mut call_changed = false;
+    let mut received_notice_text: Option<String> = None;
+    let mut transfer_changed = false;
     {
         let mut s = shared.lock().unwrap();
         match event {
@@ -649,11 +1180,36 @@ fn handle_event(
                     seq,
                 });
             }
-            LinkEvent::FileReceived { .. } => {
-                // Saved already. The window lists received files in a later change.
+            LinkEvent::FileReceived { phone, path } => {
+                let known = s
+                    .phones
+                    .get(&phone)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                let phone_name = phone_display_name(&known, &phone);
+                // "Received <name> from <phone>" — saved file name and the phone's name.
+                received_notice_text = Some(s.record_received(&phone, &phone_name, &path));
+                transfer_changed = true;
             }
-            LinkEvent::FileSendProgress { .. } | LinkEvent::FileSendFinished { .. } => {
-                // Outbound progress is shown in a later change.
+            LinkEvent::FileSendProgress {
+                phone,
+                transfer,
+                name,
+                sent,
+                size,
+            } => {
+                s.note_send_progress(&phone, &transfer, &name, sent, size);
+                transfer_changed = s.transfer_emit_due();
+            }
+            LinkEvent::FileSendFinished {
+                phone,
+                transfer,
+                name,
+                ok,
+                error,
+            } => {
+                s.note_send_finished(&phone, &transfer, &name, ok, error);
+                transfer_changed = true;
             }
         }
     }
@@ -689,14 +1245,22 @@ fn handle_event(
             .body(caller)
             .show();
     }
+    if transfer_changed {
+        let _ = app.emit("file-transfer", ());
+    }
+    if let (Some(text), true) = (received_notice_text, system_notifications) {
+        // Headless machines have no notification service; that's fine.
+        let _ = app.notification().builder().title(text).show();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Link, NotificationView, Shared};
+    use super::{DropPhone, DropPlan, Link, NotificationView, PhoneView, Shared};
     use seam_core::link::protocol::CallState;
     use seam_core::link::{LinkServer, Message, PhoneNotification};
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
     fn view(phone: &str, id: &str) -> NotificationView {
@@ -1238,5 +1802,436 @@ mod tests {
         link.forget("phone-b").unwrap();
         assert!(link.status().call.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn phone_view(id: &str, name: &str, connected: bool) -> PhoneView {
+        PhoneView {
+            id: id.to_string(),
+            name: name.to_string(),
+            connected,
+            battery: None,
+        }
+    }
+
+    fn link_with(phones: Vec<PhoneView>) -> Link {
+        let mut map = HashMap::new();
+        for phone in phones {
+            map.insert(phone.id.clone(), phone);
+        }
+        Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared {
+                phones: map,
+                ..Shared::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn send_progress_keeps_one_row_and_records_the_result() {
+        let mut shared = Shared::default();
+        let id = "ab".repeat(16);
+        shared.note_send_progress("phone-a", &id, "photo.jpg", 0, 10);
+        shared.note_send_progress("phone-a", &id, "photo.jpg", 4, 10);
+        shared.note_send_progress("phone-a", "bb".repeat(16).as_str(), "other.txt", 1, 2);
+        assert_eq!(shared.sends.len(), 2);
+        assert_eq!(shared.sends[0].name, "other.txt");
+        assert_eq!(shared.sends[1].transfer, id);
+        assert_eq!(shared.sends[1].sent, 4);
+        assert_eq!(shared.sends[1].state, "sending");
+        assert!(shared.sends[1].error.is_none());
+
+        shared.note_send_finished("phone-a", &id, "photo.jpg", false, Some("cancelled".into()));
+        assert_eq!(shared.sends[1].state, "failed");
+        assert_eq!(shared.sends[1].error.as_deref(), Some("cancelled"));
+        assert_eq!(shared.sends[1].sent, 4);
+        // A late progress event must not reopen a finished transfer.
+        shared.note_send_progress("phone-a", &id, "photo.jpg", 0, 10);
+        assert_eq!(shared.sends[1].state, "failed");
+        assert_eq!(shared.sends[1].sent, 4);
+
+        shared.note_send_finished("phone-a", "missing", "", false, Some("  ".into()));
+        assert_eq!(shared.sends[0].name, "file");
+        assert_eq!(
+            shared.sends[0].error.as_deref(),
+            Some("could not send the file")
+        );
+        shared.note_send_finished("phone-a", "missing", "a.txt", true, Some("nope".into()));
+        assert_eq!(shared.sends[0].state, "done");
+        assert_eq!(shared.sends[0].name, "a.txt");
+        assert!(shared.sends[0].error.is_none());
+    }
+
+    #[test]
+    fn received_files_are_listed_newest_first_with_the_notice_text() {
+        assert_eq!(
+            super::received_notice("photo.jpg", "Pixel"),
+            "Received photo.jpg from Pixel"
+        );
+        assert_eq!(
+            super::received_notice("photo (1).jpg", "Ada's Phone"),
+            "Received photo (1).jpg from Ada's Phone"
+        );
+        assert_eq!(super::file_label(Path::new("../../etc/passwd")), "passwd");
+        assert_eq!(super::file_label(Path::new("/")), "file");
+        assert_eq!(super::phone_display_name("  Pixel  ", "id"), "Pixel");
+        assert_eq!(super::phone_display_name("   ", "phone-1"), "phone-1");
+
+        let mut shared = Shared::default();
+        let first = shared.record_received("phone-1", "Pixel", Path::new("/tmp/a/old.txt"));
+        assert_eq!(first, "Received old.txt from Pixel");
+        let second = shared.record_received("phone-1", "Pixel", Path::new("/tmp/a/new.txt"));
+        assert_eq!(second, "Received new.txt from Pixel");
+        assert_eq!(shared.received[0].name, "new.txt");
+        assert_eq!(shared.received[1].name, "old.txt");
+        assert_eq!(
+            shared.received[0].path,
+            Path::new("/tmp/a/new.txt").to_string_lossy()
+        );
+        assert_eq!(shared.received[0].phone, "phone-1");
+        assert_eq!(shared.received[0].phone_name, "Pixel");
+
+        for i in 0..(super::KEEP_RECEIVED + 3) {
+            shared.record_received("phone-1", "Pixel", Path::new(&format!("/tmp/n{i}.txt")));
+        }
+        assert_eq!(shared.received.len(), super::KEEP_RECEIVED);
+        assert_eq!(
+            shared.received[0].name,
+            format!("n{}.txt", super::KEEP_RECEIVED + 2)
+        );
+    }
+
+    #[test]
+    fn file_views_are_on_link_status_for_the_window() {
+        let link = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let empty = serde_json::to_value(link.status()).unwrap();
+        assert!(empty["sends"].as_array().unwrap().is_empty());
+        assert!(empty["received"].as_array().unwrap().is_empty());
+
+        let id = "cd".repeat(16);
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.note_send_progress("phone-a", &id, "photo.jpg", 3, 10);
+            shared.record_received("phone-a", "Pixel", Path::new("/tmp/seam-dl/photo.jpg"));
+        }
+        let mid = serde_json::to_value(link.status()).unwrap();
+        assert!(mid["sends"][0].get("error").is_none());
+        assert_eq!(mid["sends"][0]["state"], "sending");
+        assert_eq!(mid["sends"][0]["sent"], 3);
+        assert_eq!(mid["sends"][0]["size"], 10);
+
+        link.shared.lock().unwrap().note_send_finished(
+            "phone-a",
+            &id,
+            "photo.jpg",
+            false,
+            Some("cancelled".into()),
+        );
+        let json = serde_json::to_value(link.status()).unwrap();
+        let send = &json["sends"][0];
+        assert_eq!(send["phone"], "phone-a");
+        assert_eq!(send["name"], "photo.jpg");
+        assert_eq!(send["state"], "failed");
+        assert_eq!(send["error"], "cancelled");
+        assert_eq!(send["transfer"], id);
+        let file = &json["received"][0];
+        assert_eq!(file["name"], "photo.jpg");
+        assert_eq!(file["phone_name"], "Pixel");
+        assert_eq!(file["phone"], "phone-a");
+        assert_eq!(
+            file["path"],
+            Path::new("/tmp/seam-dl/photo.jpg")
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+
+    #[test]
+    fn drop_plan_json_uses_the_action_the_window_reads() {
+        let ask = DropPlan::Ask {
+            phones: vec![DropPhone {
+                id: "a".into(),
+                name: "Pixel".into(),
+            }],
+            paths: vec!["/tmp/a.txt".into()],
+        };
+        let json = serde_json::to_value(&ask).unwrap();
+        assert_eq!(json["action"], "ask");
+        assert_eq!(json["phones"][0]["id"], "a");
+        assert_eq!(json["phones"][0]["name"], "Pixel");
+        assert_eq!(json["paths"][0], "/tmp/a.txt");
+
+        let err = DropPlan::Error {
+            message: "no phone is connected".into(),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["action"], "error");
+        assert_eq!(json["message"], "no phone is connected");
+
+        let sent = DropPlan::Sent {
+            phone: "Pixel".into(),
+        };
+        let json = serde_json::to_value(&sent).unwrap();
+        assert_eq!(json["action"], "sent");
+        assert_eq!(json["phone"], "Pixel");
+    }
+
+    #[test]
+    fn drop_goes_to_the_only_phone_and_asks_when_several_are_connected() {
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        match offline.deliver_drop(&[]).unwrap() {
+            DropPlan::Error { message } => assert_eq!(message, "no file chosen"),
+            other => panic!("expected error, got {other:?}"),
+        }
+        match offline.deliver_drop(&[String::new()]).unwrap() {
+            DropPlan::Error { message } => assert_eq!(message, "no file chosen"),
+            other => panic!("expected error, got {other:?}"),
+        }
+        match offline
+            .deliver_drop(&[std::env::temp_dir().to_string_lossy().into_owned()])
+            .unwrap()
+        {
+            DropPlan::Error { message } => assert_eq!(message, "not a file"),
+            other => panic!("expected not a file, got {other:?}"),
+        }
+
+        let disconnected = link_with(vec![phone_view("a", "Pixel", false)]);
+        match disconnected
+            .deliver_drop(&["/tmp/seam-no-such-file.txt".into()])
+            .unwrap()
+        {
+            DropPlan::Error { message } => assert_eq!(message, "not a file"),
+            other => panic!("expected not a file, got {other:?}"),
+        }
+
+        let dir = std::env::temp_dir().join(format!("seam-drop-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let file_s = file.to_string_lossy().into_owned();
+
+        let one = link_with(vec![
+            phone_view("a", "Pixel", true),
+            phone_view("b", "Galaxy", false),
+        ]);
+        // The disconnected phone is not a target, so this tries to send and hits the offline link.
+        assert_eq!(
+            one.deliver_drop(&[file_s.clone(), dir.to_string_lossy().into_owned()])
+                .unwrap_err(),
+            "the phone link is not running"
+        );
+
+        let two = link_with(vec![
+            phone_view("b", "Pixel", true),
+            phone_view("a", "Galaxy", true),
+        ]);
+        match two
+            .deliver_drop(&[file_s.clone(), dir.to_string_lossy().into_owned()])
+            .unwrap()
+        {
+            DropPlan::Ask { phones, paths } => {
+                assert_eq!(phones[0].name, "Galaxy");
+                assert_eq!(phones[0].id, "a");
+                assert_eq!(phones[1].name, "Pixel");
+                assert_eq!(paths, vec![file_s]);
+            }
+            other => panic!("expected ask, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_files_are_not_hidden_by_a_later_failure() {
+        // The command returns Sent (Ok) when any file was queued, so the window
+        // does not treat a partial multi-file drop as a total failure.
+        assert!(super::classify_send_batch(2, Some("could not open the file".into())).is_ok());
+        assert!(super::classify_send_batch(1, None).is_ok());
+        assert_eq!(
+            super::classify_send_batch(0, Some("not a file".into())).unwrap_err(),
+            "not a file"
+        );
+        assert_eq!(
+            super::classify_send_batch(0, None).unwrap_err(),
+            "no file chosen"
+        );
+    }
+
+    #[test]
+    fn a_send_that_never_starts_is_listed_as_failed() {
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let err = offline
+            .send_file("phone-1", "/tmp/photo (1).jpg")
+            .unwrap_err();
+        assert_eq!(err, "the phone link is not running");
+        let sends = offline.status().sends;
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].name, "photo (1).jpg");
+        assert_eq!(sends[0].state, "failed");
+        assert_eq!(
+            sends[0].error.as_deref(),
+            Some("the phone link is not running")
+        );
+        assert!(sends[0].transfer.starts_with("local-"));
+        assert_eq!(
+            offline.send_file("phone-1", "").unwrap_err(),
+            "no file chosen"
+        );
+        assert_eq!(offline.status().sends.len(), 1);
+    }
+
+    #[test]
+    fn send_file_requires_a_connected_phone_and_cancel_reports_unknown() {
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            offline.send_file("phone-1", "").unwrap_err(),
+            "no file chosen"
+        );
+        assert_eq!(
+            offline.cancel_send("ab").unwrap_err(),
+            "the phone link is not running"
+        );
+
+        let dir = std::env::temp_dir().join(format!("seam-send-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Desk".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        let path = dir.join("note.txt");
+        std::fs::write(&path, b"hi").unwrap();
+        assert_eq!(
+            link.send_file("phone-1", &path.to_string_lossy())
+                .unwrap_err(),
+            "this phone is not connected"
+        );
+        assert_eq!(
+            link.cancel_send(&"ab".repeat(16)).unwrap_err(),
+            "this transfer is not running"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reveal_only_lists_received_files_and_reports_missing() {
+        let link = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(link.reveal_received("").unwrap_err(), "unknown file");
+        assert_eq!(
+            link.reveal_received("/etc/passwd").unwrap_err(),
+            "unknown file"
+        );
+
+        let missing = std::env::temp_dir().join(format!(
+            "seam-missing-reveal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert!(!missing.exists());
+        link.shared
+            .lock()
+            .unwrap()
+            .record_received("phone-1", "Pixel", &missing);
+        let stored = link.shared.lock().unwrap().received[0].path.clone();
+        assert_eq!(link.reveal_received(&stored).unwrap_err(), "file is gone");
+        assert_eq!(
+            link.reveal_received(&(stored.clone() + ".nope"))
+                .unwrap_err(),
+            "unknown file"
+        );
+        assert_eq!(
+            link.reveal_received("/etc/passwd").unwrap_err(),
+            "unknown file"
+        );
+    }
+
+    #[test]
+    fn dropped_paths_skip_blank_entries() {
+        let paths = [
+            PathBuf::from("/tmp/a.txt"),
+            PathBuf::from(""),
+            PathBuf::from("/tmp/b.txt"),
+        ];
+        assert_eq!(
+            super::dropped_path_list(&paths),
+            vec!["/tmp/a.txt".to_string(), "/tmp/b.txt".to_string()]
+        );
+        assert!(super::dropped_path_list(&[]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_uri_encodes_spaces_and_keeps_slashes() {
+        assert_eq!(
+            super::file_uri(Path::new("/tmp/a b.txt")),
+            "file:///tmp/a%20b.txt"
+        );
+        let nested = Path::new("/tmp/seam").join("photo (1).jpg");
+        let uri = super::file_uri(&nested);
+        assert!(uri.starts_with("file://"));
+        assert!(!uri.contains(' '));
+        assert!(uri.contains("photo"));
+        assert!(uri.contains("%28"));
+    }
+
+    #[test]
+    fn windows_select_arg_is_a_raw_quoted_switch() {
+        // Must be passed with raw_arg. Command::arg would wrap this whole token
+        // in another pair of quotes and Explorer would miss /select.
+        assert_eq!(
+            super::windows_select_arg(Path::new("photo (1).jpg")),
+            r#"/select,"photo (1).jpg""#
+        );
+        let nested = Path::new("Ada Lovelace").join("photo (1).jpg");
+        let arg = super::windows_select_arg(&nested);
+        assert!(arg.starts_with("/select,\""));
+        assert!(arg.ends_with('"'));
+        assert!(!arg.starts_with('"'));
+        assert!(arg.contains("Ada Lovelace"));
+        assert!(arg.contains("photo (1).jpg"));
+    }
+
+    #[test]
+    fn linux_show_items_quotes_the_uri_and_bounds_the_wait() {
+        let uri = "file:///home/ada/photo%20(1).jpg";
+        let args = super::linux_show_items_args(uri);
+        assert!(args
+            .iter()
+            .any(|arg| { arg == r#"array:string:"file:///home/ada/photo%20(1).jpg""# }));
+        assert!(args.iter().any(|arg| arg == r#"string:"""#));
+        assert!(args.iter().any(|arg| arg == "--print-reply"));
+        assert!(args.iter().any(|arg| {
+            arg.strip_prefix("--reply-timeout=")
+                .and_then(|ms| ms.parse::<u64>().ok())
+                .is_some_and(|ms| ms > 0 && ms <= 5_000)
+        }));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "string:" || arg.starts_with("array:string:file:")));
+        let path = Path::new("/tmp/seam").join("photo (1).jpg");
+        assert_eq!(super::folder_to_open(&path), path.parent().unwrap());
+        assert_eq!(
+            super::macos_reveal_args(&path),
+            vec!["-R".to_string(), path.display().to_string()]
+        );
     }
 }
