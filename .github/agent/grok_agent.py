@@ -247,13 +247,28 @@ def main():
     sh("git", "checkout", "-B", branch)
 
     feedback, summary, review = previous_failure(num), "", {}
+    # Continue from the last failed run's work if it was saved, instead of starting over.
+    keep = False
+    attempt_branch = f"agent/issue-{num}-attempt"
+    if feedback and sh("git", "fetch", "-q", "origin", attempt_branch, check=False).returncode == 0:
+        if sh("git", "cherry-pick", "-n", "FETCH_HEAD", check=False).returncode == 0:
+            keep = True
+            print(f"continuing from {attempt_branch}", flush=True)
+        else:
+            sh("git", "cherry-pick", "--abort", check=False)
+            sh("git", "reset", "--hard", "-q", "HEAD")
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"--- attempt {attempt}/{MAX_ATTEMPTS}", flush=True)
-        sh("git", "reset", "--hard", "-q", "HEAD")
-        sh("git", "clean", "-fdq")
+        if not keep:
+            sh("git", "reset", "--hard", "-q", "HEAD")
+            sh("git", "clean", "-fdq")
         prompt = f"{issue_text}\n\n--- REPOSITORY ---\n{repo_snapshot()}"
+        if keep:
+            prompt += ("\n\n--- NOTE ---\nThe repository above ALREADY CONTAINS your previous attempt "
+                       "(uncommitted). Don't start over: make only the edits needed to fix the problems below.")
         if feedback:
             prompt += f"\n\n--- YOUR PREVIOUS ATTEMPT WAS REJECTED ---\n{feedback}"
+        keep = False
         try:
             plan = grok(ENGINEER, prompt)
             summary = plan.get("summary", "")
@@ -281,15 +296,27 @@ def main():
         print(f"tests {'passed' if ok else 'FAILED'}\n{test_out}", flush=True)
         if not ok:
             feedback = f"Tests failed:\n{test_out}\n\nYour diff was:\n{diff}"
+            keep = True
             continue
         review = review_change(issue_text, diff, test_out)
         print(f"review: {review}", flush=True)
         if review.get("approve"):
             break
         feedback = f"Reviewer rejected it: {review.get('comments')}\n\nYour diff was:\n{diff}"
+        keep = True
     else:
+        saved = ""
+        # Save the last attempt so the next run (or a human) can finish it instead of starting over.
+        sh("git", "add", "-A")
+        if sh("git", "diff", "--cached", "--quiet", check=False).returncode != 0:
+            sh("git", "-c", "user.name=grok-agent", "-c", "user.email=grok-agent@users.noreply.github.com",
+               "commit", "-q", "-m", f"Unfinished attempt for #{num}")
+            sh("git", *git_auth(), "push", "-q", "origin", "--delete", attempt_branch, check=False)
+            if sh("git", *git_auth(), "push", "-q", "origin", f"HEAD:refs/heads/{attempt_branch}",
+                  check=False).returncode == 0:
+                saved = f"\n\nThe last attempt is saved on branch `{attempt_branch}`; the next run continues from it."
         gh_api("POST", f"repos/{REPO}/issues/{num}/comments", {"body":
-               f"🤖 Grok agent could not produce an approved, passing fix after {MAX_ATTEMPTS} attempts.\n\n"
+               f"🤖 Grok agent could not produce an approved, passing fix after {MAX_ATTEMPTS} attempts.{saved}\n\n"
                f"Last feedback:\n```\n{feedback[:3000]}\n```"})
         sys.exit(1)
 
@@ -322,6 +349,7 @@ def main():
     # between the old and new base as workflow changes made by this app, and refuses them.
     sh("git", *git_auth(), "push", "-q", "origin", "--delete", branch, check=False)
     sh("git", *git_auth(), "push", "origin", branch)
+    sh("git", *git_auth(), "push", "-q", "origin", "--delete", attempt_branch, check=False)
     owner = REPO.split("/")[0]
     existing = gh_api("GET", f"repos/{REPO}/pulls?state=open&head={owner}:{branch}")
     if existing:
