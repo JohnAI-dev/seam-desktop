@@ -1,4 +1,4 @@
-//! Helpers for receiving a file from a paired phone.
+//! Helpers for receiving a file from a paired phone, and for reading one the desktop sends.
 //!
 //! See `protocol/PROTOCOL.md`, section "Sending files". Names are reduced to a single
 //! path segment so a transfer can never write outside the download folder. [`Receiver`]
@@ -8,7 +8,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -154,6 +154,69 @@ pub(crate) fn decode_chunk(data: &str) -> Result<Vec<u8>, &'static str> {
         return Err("chunk is too large");
     }
     Ok(bytes)
+}
+
+/// MIME type for `name`, when the extension is one we know. Unknown types are omitted.
+pub(crate) fn guess_mime(name: &str) -> Option<&'static str> {
+    let (stem, ext) = split_stem_ext(name);
+    let ext = ext.strip_prefix('.')?;
+    if stem.is_empty() || ext.is_empty() {
+        return None;
+    }
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "pdf" => Some("application/pdf"),
+        "txt" => Some("text/plain"),
+        "json" => Some("application/json"),
+        "zip" => Some("application/zip"),
+        "mp3" => Some("audio/mpeg"),
+        "mp4" => Some("video/mp4"),
+        _ => None,
+    }
+}
+
+/// File name to put in `file_offer`: the final path segment, sanitized.
+pub(crate) fn offer_name(path: &Path) -> String {
+    let raw = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    sanitize_name(raw)
+}
+
+/// Read up to `max` bytes. `Ok(None)` means EOF before any byte was read.
+pub(crate) fn read_next_chunk(
+    file: &mut impl Read,
+    max: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    if max == 0 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; max];
+    let mut filled = 0;
+    while filled < max {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if filled == 0 {
+        Ok(None)
+    } else {
+        buf.truncate(filled);
+        Ok(Some(buf))
+    }
+}
+
+/// Reject a file larger than the protocol allows.
+pub(crate) fn check_file_size(size: u64) -> Result<(), &'static str> {
+    if size > MAX_FILE_BYTES {
+        Err("file is larger than 2 GiB")
+    } else {
+        Ok(())
+    }
 }
 
 /// Streaming check of an inbound file: sequence, size, then SHA-256 at `file_done`.
@@ -627,5 +690,70 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"");
         assert!(part_files(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guess_mime_uses_the_extension_when_it_is_known() {
+        assert_eq!(guess_mime("photo.jpg"), Some("image/jpeg"));
+        assert_eq!(guess_mime("photo.JPEG"), Some("image/jpeg"));
+        assert_eq!(guess_mime("photo.PNG"), Some("image/png"));
+        assert_eq!(guess_mime("notes.txt"), Some("text/plain"));
+        assert_eq!(guess_mime("clip.mp4"), Some("video/mp4"));
+        assert_eq!(guess_mime("noext"), None);
+        assert_eq!(guess_mime(".hidden"), None);
+        assert_eq!(guess_mime("file."), None);
+        assert_eq!(guess_mime("archive.tar.gz"), None);
+        assert_eq!(guess_mime("weird.xyz"), None);
+    }
+
+    #[test]
+    fn offer_name_is_the_file_name_only() {
+        assert_eq!(offer_name(std::path::Path::new("photo.jpg")), "photo.jpg");
+        assert_eq!(
+            offer_name(std::path::Path::new("dir/sub/photo.jpg")),
+            "photo.jpg"
+        );
+        assert_eq!(
+            offer_name(std::path::Path::new("../../etc/passwd")),
+            "passwd"
+        );
+        assert_eq!(offer_name(std::path::Path::new(".hidden")), "hidden");
+        assert_eq!(offer_name(std::path::Path::new("")), "file");
+        let offered = offer_name(std::path::Path::new("nested/photo.jpg"));
+        assert!(!offered.contains('/'));
+        assert!(!offered.contains('\\'));
+    }
+
+    #[test]
+    fn read_next_chunk_splits_at_the_callers_limit() {
+        let data = vec![7u8; MAX_CHUNK_BYTES + 10];
+        let mut cur = std::io::Cursor::new(data.clone());
+        let mut hasher = Sha256::new();
+        let first = read_next_chunk(&mut cur, MAX_CHUNK_BYTES).unwrap().unwrap();
+        assert_eq!(first.len(), MAX_CHUNK_BYTES);
+        hasher.update(&first);
+        let second = read_next_chunk(&mut cur, MAX_CHUNK_BYTES).unwrap().unwrap();
+        assert_eq!(second, &data[MAX_CHUNK_BYTES..]);
+        hasher.update(&second);
+        assert!(read_next_chunk(&mut cur, MAX_CHUNK_BYTES)
+            .unwrap()
+            .is_none());
+        assert!(read_next_chunk(&mut cur, 0).unwrap().is_none());
+        assert_eq!(hex::encode(hasher.finalize()), sha256_hex(&data));
+        assert!(
+            read_next_chunk(&mut std::io::Cursor::new(Vec::<u8>::new()), 8)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn send_size_limit_matches_the_protocol() {
+        assert!(check_file_size(0).is_ok());
+        assert!(check_file_size(MAX_FILE_BYTES).is_ok());
+        assert_eq!(
+            check_file_size(MAX_FILE_BYTES + 1),
+            Err("file is larger than 2 GiB")
+        );
     }
 }
