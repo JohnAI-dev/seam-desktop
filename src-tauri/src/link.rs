@@ -652,6 +652,9 @@ fn handle_event(
             LinkEvent::FileReceived { .. } => {
                 // Saved already. The window lists received files in a later change.
             }
+            LinkEvent::FileSendProgress { .. } | LinkEvent::FileSendFinished { .. } => {
+                // Outbound progress is shown in a later change.
+            }
         }
     }
     if let Some(payload) = reply_push {

@@ -695,3 +695,260 @@ async fn phone_receives_ring_then_ring_stop() {
         }
     );
 }
+
+struct SendOutcome {
+    ok: bool,
+    error: Option<String>,
+    progress: Vec<u64>,
+    battery: Option<u8>,
+}
+
+async fn next_phone_msg(phone: &mut PhoneClient) -> Message {
+    loop {
+        match next_msg(phone).await {
+            Message::Ping => phone.send(&Message::Pong).await.unwrap(),
+            other => return other,
+        }
+    }
+}
+
+async fn observe_send(events: &mut UnboundedReceiver<LinkEvent>, transfer: &str) -> SendOutcome {
+    let mut progress = Vec::new();
+    let mut battery = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("timed out waiting for the send to finish")
+            .expect("event channel closed");
+        match event {
+            LinkEvent::FileSendProgress {
+                transfer: id,
+                sent,
+                size,
+                ..
+            } if id == transfer => {
+                assert!(sent <= size);
+                progress.push(sent);
+            }
+            LinkEvent::FileSendFinished {
+                phone,
+                transfer: id,
+                ok,
+                error,
+                ..
+            } if id == transfer => {
+                assert_eq!(phone, "phone-1");
+                return SendOutcome {
+                    ok,
+                    error,
+                    progress,
+                    battery,
+                };
+            }
+            LinkEvent::Battery { level, .. } => battery = Some(level),
+            other => panic!("unexpected event during send: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn desktop_sends_a_file_and_a_reject_ends_cleanly() {
+    let (server, mut events, port) = start("send-file").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    let file_dir = temp_dir("send-file-src");
+    let nested = file_dir.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let path = nested.join("photo.jpg");
+    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &payload).unwrap();
+
+    let id = server.send_file("phone-1", &path).unwrap();
+    assert_eq!(id.len(), 32);
+    assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    match next_phone_msg(&mut phone).await {
+        Message::FileOffer {
+            transfer,
+            name,
+            size,
+            mime,
+        } => {
+            assert_eq!(transfer, id);
+            assert_eq!(name, "photo.jpg");
+            assert!(!name.contains('/'));
+            assert!(!name.contains('\\'));
+            assert_eq!(size, payload.len() as u64);
+            assert_eq!(mime.as_deref(), Some("image/jpeg"));
+        }
+        other => panic!("expected file_offer, got {other:?}"),
+    }
+    phone
+        .send(&Message::FileAccept {
+            transfer: id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let mut got = Vec::new();
+    let mut seqs = Vec::new();
+    let mut saw_dismiss = false;
+    loop {
+        match next_phone_msg(&mut phone).await {
+            Message::FileChunk {
+                transfer,
+                seq,
+                data,
+            } => {
+                assert_eq!(transfer, id);
+                let bytes = STANDARD
+                    .decode(data.as_bytes())
+                    .expect("chunk should be standard base64");
+                assert!(bytes.len() <= 256 * 1024);
+                got.extend(bytes);
+                seqs.push(seq);
+                if seq == 0 {
+                    phone
+                        .send(&Message::Battery {
+                            level: 33,
+                            charging: false,
+                        })
+                        .await
+                        .unwrap();
+                    assert!(server.send_to(
+                        "phone-1",
+                        Message::Dismiss {
+                            id: "mid-send".into(),
+                        },
+                    ));
+                }
+            }
+            Message::FileDone { transfer, sha256 } => {
+                assert_eq!(transfer, id);
+                assert_eq!(sha256, sha256_hex(&payload));
+                assert_eq!(got, payload);
+                assert_eq!(seqs, (0..seqs.len() as u64).collect::<Vec<_>>());
+                let n = seqs.len();
+                assert!(n >= 4, "expected several chunks, got {n}");
+                phone
+                    .send(&Message::FileResult {
+                        transfer,
+                        ok: true,
+                        error: None,
+                    })
+                    .await
+                    .unwrap();
+                break;
+            }
+            Message::Dismiss { id: nid } => {
+                assert_eq!(nid, "mid-send");
+                saw_dismiss = true;
+            }
+            other => panic!("unexpected frame during send: {other:?}"),
+        }
+    }
+    if !saw_dismiss {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !saw_dismiss && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, phone.recv()).await {
+                Ok(Some(Message::Dismiss { id: nid })) => {
+                    assert_eq!(nid, "mid-send");
+                    saw_dismiss = true;
+                }
+                Ok(Some(Message::Ping)) => phone.send(&Message::Pong).await.unwrap(),
+                other => {
+                    panic!("other messages must get through during a send, got {other:?}")
+                }
+            }
+        }
+    }
+    assert!(
+        saw_dismiss,
+        "a message queued during the send must be delivered"
+    );
+
+    let outcome = observe_send(&mut events, &id).await;
+    assert!(outcome.ok, "{:?}", outcome.error);
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.progress.last().copied(), Some(payload.len() as u64));
+    if outcome.battery != Some(33) {
+        match next_event(&mut events).await {
+            LinkEvent::Battery {
+                level: 33,
+                device_id,
+                ..
+            } => assert_eq!(device_id, "phone-1"),
+            other => panic!("expected the battery sent during the transfer, got {other:?}"),
+        }
+    }
+
+    let rejected = file_dir.join("nope.txt");
+    std::fs::write(&rejected, b"no thanks").unwrap();
+    let id2 = server.send_file("phone-1", &rejected).unwrap();
+    match next_phone_msg(&mut phone).await {
+        Message::FileOffer {
+            transfer,
+            name,
+            size,
+            ..
+        } => {
+            assert_eq!(transfer, id2);
+            assert_eq!(name, "nope.txt");
+            assert_eq!(size, 9);
+        }
+        other => panic!("expected offer, got {other:?}"),
+    }
+    phone
+        .send(&Message::FileReject {
+            transfer: id2.clone(),
+            reason: Some("no space".into()),
+        })
+        .await
+        .unwrap();
+    let outcome = observe_send(&mut events, &id2).await;
+    assert!(!outcome.ok);
+    assert_eq!(outcome.error.as_deref(), Some("no space"));
+    match tokio::time::timeout(Duration::from_millis(50), phone.recv()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(Message::Ping)) => phone.send(&Message::Pong).await.unwrap(),
+        Ok(Some(other)) => panic!("reject should end the transfer, got {other:?}"),
+    }
+
+    let cancel_path = file_dir.join("later.txt");
+    std::fs::write(&cancel_path, b"later").unwrap();
+    let id3 = server.send_file("phone-1", &cancel_path).unwrap();
+    match next_phone_msg(&mut phone).await {
+        Message::FileOffer { transfer, .. } => assert_eq!(transfer, id3),
+        other => panic!("expected offer, got {other:?}"),
+    }
+    assert!(server.cancel_send(&id3));
+    match next_phone_msg(&mut phone).await {
+        Message::FileCancel { transfer } => assert_eq!(transfer, id3),
+        other => panic!("expected file_cancel, got {other:?}"),
+    }
+    let outcome = observe_send(&mut events, &id3).await;
+    assert!(!outcome.ok);
+    assert_eq!(outcome.error.as_deref(), Some("cancelled"));
+    assert!(!server.cancel_send(&id3));
+
+    phone
+        .send(&Message::Battery {
+            level: 3,
+            charging: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-1".into(),
+            level: 3,
+            charging: false,
+        }
+    );
+    let _ = std::fs::remove_dir_all(&file_dir);
+}
