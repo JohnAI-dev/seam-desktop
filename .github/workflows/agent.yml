@@ -71,8 +71,8 @@ jobs:
                 if [[ ! "$labeled" > "$at" ]]; then
                   # Grok gave up after all attempts: continue automatically (from the saved attempt)
                   # until every engineer has had its 3 runs (see MAX_FAILED_RUNS).
-                  fails=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq "[.[] | select(.created_at > \"$labeled\") | select(.body | startswith(\"🤖 Grok agent could not produce\"))] | length")
-                  case "$body" in "🤖 Grok agent could not produce"*) [ "$fails" -lt "$MAX_FAILED_RUNS" ] || continue ;; *) continue ;; esac
+                  fails=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq "[.[] | select(.created_at > \"$labeled\") | select(.body | startswith(\"🤖 Grok agent could not\"))] | length")
+                  case "$body" in "🤖 Grok agent could not"*) [ "$fails" -lt "$MAX_FAILED_RUNS" ] || continue ;; *) continue ;; esac
                 fi ;;
             esac
             echo "issue=$n" >> "$GITHUB_OUTPUT"; echo "picked #$n"; exit 0
@@ -185,4 +185,11 @@ jobs:
       - name: Start the next waiting issue
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run agent.yml -R ${{ github.repository }} --ref main
+        run: |
+          # The hourly schedule picks the queue up anyway if this fails.
+          for i in 1 2 3; do
+            if out=$(gh api -X POST repos/${{ github.repository }}/actions/workflows/agent.yml/dispatches -f ref=main 2>&1); then
+              echo "next run requested"; exit 0
+            fi
+            echo "::warning title=Could not start the next run (try $i)::$out"; sleep 20
+          done

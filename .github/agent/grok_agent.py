@@ -179,7 +179,7 @@ def choose_engineer(num):
                        if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == "agent"), default="")
         comments = gh_api("GET", f"repos/{REPO}/issues/{num}/comments?per_page=100") or []
         fails = sum(1 for c in comments if c["created_at"] > labeled
-                    and (c.get("body") or "").startswith("🤖 Grok agent could not produce"))
+                    and (c.get("body") or "").startswith("🤖 Grok agent could not"))
     except Exception:
         fails = 0
     available = [e for e in ENGINEERS if _KEYS[e[0]]]
