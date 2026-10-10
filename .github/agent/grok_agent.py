@@ -39,18 +39,30 @@ def _load_secrets():
     """Read the tokens from files the workflow wrote, then delete them. They are never in
     this process's environment, so code under test can't read them from /proc either."""
     d = os.environ.get("AGENT_SECRETS_DIR")
+    names = {"xai": "XAI_API_KEY", "gh": "GH_TOKEN", "anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
     if not d:
-        return os.environ.get("XAI_API_KEY", ""), os.environ.get("GH_TOKEN", "")
-    out = []
-    for name in ("xai", "gh"):
+        return {k: os.environ.get(v, "") for k, v in names.items()}
+    out = {}
+    for name in names:
         f = Path(d, name)
-        out.append(f.read_text().strip())
-        f.unlink()
+        out[name] = f.read_text().strip() if f.exists() else ""
+        if f.exists():
+            f.unlink()
     Path(d).rmdir()
-    return tuple(out)
+    return out
 
 
-XAI_KEY, GH_TOKEN = _load_secrets()
+_KEYS = _load_secrets()
+XAI_KEY, GH_TOKEN = _KEYS["xai"], _KEYS["gh"]
+
+# Engineers, in escalation order: Grok first; if it fails 3 runs in a row on an issue,
+# Claude takes over; after 3 more, OpenAI. A provider without an API key is skipped.
+ENGINEERS = [
+    ("xai", "Grok", os.environ.get("XAI_MODEL") or "grok-4.7"),
+    ("anthropic", "Claude", os.environ.get("ANTHROPIC_MODEL") or "claude-opus-5-5"),
+    ("openai", "OpenAI", os.environ.get("OPENAI_MODEL") or "gpt-5"),
+]
+RUNS_PER_ENGINEER = 3
 
 
 def git_auth():
@@ -77,40 +89,54 @@ def gh_api(method, path, body=None):
         return json.loads(r.read() or b"{}")
 
 
-def grok(system, user):
-    body = {"model": MODEL, "temperature": 0.2, "stream": True,
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": user}]}
-    req = urllib.request.Request(
-        API_URL, data=json.dumps(body).encode(), method="POST",
-        headers={"Authorization": f"Bearer {XAI_KEY}",
-                 "Content-Type": "application/json"})
+def llm(provider, system, user):
+    """One JSON answer from a model. Streamed, so long answers aren't cut off as idle
+    connections; the timeout is per read, not in total."""
+    model = next(m for p, _, m in ENGINEERS if p == provider)
+    if provider == "anthropic":
+        url = os.environ.get("ANTHROPIC_API_URL", "https://api.anthropic.com/v1/messages")
+        body = {"model": model, "max_tokens": 32000, "stream": True, "system": system,
+                "messages": [{"role": "user", "content": user}]}
+        headers = {"x-api-key": _KEYS["anthropic"], "anthropic-version": "2023-06-01",
+                   "Content-Type": "application/json"}
+        reader = read_anthropic_stream
+    else:
+        url = (os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1/chat/completions")
+               if provider == "openai" else API_URL)
+        body = {"model": model, "stream": True, "response_format": {"type": "json_object"},
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        if provider == "xai":
+            body["temperature"] = 0.2
+        headers = {"Authorization": f"Bearer {_KEYS[provider]}", "Content-Type": "application/json"}
+        reader = read_stream
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
     text = None
     for attempt in range(3):
         try:
-            # Streamed, so data keeps flowing while Grok works and long answers don't
-            # get cut off as idle connections. The timeout is per read, not in total.
             with urllib.request.urlopen(req, timeout=300) as r:
-                text = read_stream(r)
+                text = reader(r)
             break
         except urllib.error.HTTPError as e:
-            if e.code not in (429, 500, 502, 503, 504) or attempt == 2:
+            if e.code not in (429, 500, 502, 503, 504, 529) or attempt == 2:
                 raise
-            print(f"Grok API returned {e.code}; retrying", flush=True)
+            print(f"{provider} API returned {e.code}; retrying", flush=True)
         except (TimeoutError, OSError) as e:
             if attempt == 2:
                 raise
-            print(f"Grok API call failed ({e}); retrying", flush=True)
+            print(f"{provider} API call failed ({e}); retrying", flush=True)
         time.sleep(15 * (attempt + 1))
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
-    # Take the first complete JSON object; ignore anything Grok adds after it.
+    # Take the first complete JSON object; ignore anything the model adds after it.
     obj, _ = json.JSONDecoder().raw_decode(text[text.index("{"):])
     return obj
 
 
+def grok(system, user):
+    return llm("xai", system, user)
+
+
 def read_stream(response):
-    """Collect the answer from a server-sent-events chat completion stream."""
+    """Collect the answer from an OpenAI-style server-sent-events chat completion stream."""
     parts, finished = [], False
     for raw in response:
         line = raw.decode("utf-8", errors="replace").strip()
@@ -126,8 +152,46 @@ def read_stream(response):
             if choice.get("finish_reason"):
                 finished = True
     if not finished:
-        raise OSError("Grok stream ended early")
+        raise OSError("stream ended early")
     return "".join(parts)
+
+
+def read_anthropic_stream(response):
+    """Collect the text from an Anthropic Messages API stream."""
+    parts, finished = [], False
+    for raw in response:
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        event = json.loads(line[5:].strip())
+        kind = event.get("type")
+        if kind == "content_block_delta" and (event.get("delta") or {}).get("type") == "text_delta":
+            parts.append(event["delta"].get("text", ""))
+        elif kind == "message_stop":
+            finished = True
+        elif kind == "error":
+            raise OSError(f"Anthropic stream error: {event.get('error')}")
+    if not finished:
+        raise OSError("stream ended early")
+    return "".join(parts)
+
+
+def choose_engineer(num):
+    """Grok for the first runs on an issue; escalate after RUNS_PER_ENGINEER failed runs
+    in a row (counted since the `agent` label was last added)."""
+    try:
+        events = gh_api("GET", f"repos/{REPO}/issues/{num}/events?per_page=100") or []
+        labeled = max((e["created_at"] for e in events
+                       if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == "agent"), default="")
+        comments = gh_api("GET", f"repos/{REPO}/issues/{num}/comments?per_page=100") or []
+        fails = sum(1 for c in comments if c["created_at"] > labeled
+                    and (c.get("body") or "").startswith("🤖 Grok agent could not produce"))
+    except Exception:
+        fails = 0
+    available = [e for e in ENGINEERS if _KEYS[e[0]]]
+    if not available:
+        raise RuntimeError("no engineer API key is set")
+    return available[min(fails // RUNS_PER_ENGINEER, len(available) - 1)]
 
 
 def repo_snapshot():
@@ -250,6 +314,8 @@ def main():
     sh("git", "checkout", "-B", branch)
 
     feedback, summary, review = previous_failure(num), "", {}
+    engineer = choose_engineer(num)
+    print(f"engineer: {engineer[1]} ({engineer[2]})", flush=True)
     # Continue from the last failed run's work if it was saved, instead of starting over.
     keep = False
     attempt_branch = f"agent/issue-{num}-attempt"
@@ -273,14 +339,14 @@ def main():
             prompt += f"\n\n--- YOUR PREVIOUS ATTEMPT WAS REJECTED ---\n{feedback}"
         keep = False
         try:
-            plan = grok(ENGINEER, prompt)
+            plan = llm(engineer[0], ENGINEER, prompt)
             summary = plan.get("summary", "")
             touched = apply_changes(plan.get("changes", []))
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:500]
             if e.code in (401, 403) or (e.code == 400 and "api key" in body.lower()):
                 gh_api("POST", f"repos/{REPO}/issues/{num}/comments", {"body":
-                       f"🤖 xAI rejected the API key (HTTP {e.code}: {body}). Check the `XAI_API_KEY` secret in "
+                       f"🤖 {engineer[1]}'s API rejected the key (HTTP {e.code}: {body}). Check the API key secret in "
                        "Settings → Secrets and variables → Actions, then re-run the Grok agent workflow."})
                 sys.exit(1)
             feedback = f"Grok API error: {e} {body}"
@@ -319,7 +385,8 @@ def main():
                   check=False).returncode == 0:
                 saved = f"\n\nThe last attempt is saved on branch `{attempt_branch}`; the next run continues from it."
         gh_api("POST", f"repos/{REPO}/issues/{num}/comments", {"body":
-               f"🤖 Grok agent could not produce an approved, passing fix after {MAX_ATTEMPTS} attempts.{saved}\n\n"
+               f"🤖 Grok agent could not produce an approved, passing fix after {MAX_ATTEMPTS} attempts "
+               f"(engineer: {engineer[1]}).{saved}\n\n"
                f"Last feedback:\n```\n{feedback[:3000]}\n```"})
         sys.exit(1)
 
@@ -363,7 +430,7 @@ def main():
     else:
         pr = gh_api("POST", f"repos/{REPO}/pulls", {
             "title": f"Fix #{num}: {title}", "head": branch, "base": "main",
-            "body": f"{summary}\n\nFixes #{num}\n\n**Grok review:** {review.get('comments', '')}"})
+            "body": f"{summary}\n\nFixes #{num}\n\n**Engineer:** {engineer[1]} ({engineer[2]})\n\n**Grok review:** {review.get('comments', '')}"})
     print(f"opened PR #{pr['number']}", flush=True)
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
         f.write(f"branch={branch}\npr={pr['number']}\n")
