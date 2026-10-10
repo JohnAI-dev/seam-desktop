@@ -659,3 +659,39 @@ async fn phone_sends_a_file_and_a_wrong_hash_leaves_nothing() {
     assert_eq!(file_names(&download), before);
     assert_eq!(std::fs::read(download.join("passwd (1)")).unwrap(), second);
 }
+
+#[tokio::test]
+async fn phone_receives_ring_then_ring_stop() {
+    let (server, mut events, port) = start("ring").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    assert!(server.send_to("phone-1", Message::Ring));
+    let got = next_msg(&mut phone).await;
+    assert_eq!(got.to_line(), r#"{"type":"ring"}"#);
+    assert_eq!(got, Message::Ring);
+
+    assert!(server.send_to("phone-1", Message::RingStop));
+    let got = next_msg(&mut phone).await;
+    assert_eq!(got.to_line(), r#"{"type":"ring_stop"}"#);
+    assert_eq!(got, Message::RingStop);
+
+    phone
+        .send(&Message::Battery {
+            level: 11,
+            charging: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-1".into(),
+            level: 11,
+            charging: false,
+        }
+    );
+}

@@ -75,6 +75,8 @@ pub struct LinkStatus {
     notifications: Vec<NotificationView>,
     /// Ringing call to show, or null when the banner should be hidden.
     call: Option<CallView>,
+    /// How long the Ring button stays on Stop, in seconds.
+    ring_secs: u64,
 }
 
 #[derive(Serialize)]
@@ -186,6 +188,15 @@ fn reply_error_text(error: Option<String>) -> String {
     }
 }
 
+/// Frame for Find my phone: `ring` starts, `ring_stop` stops.
+fn ring_message(action: &str) -> Result<Message, &'static str> {
+    match action {
+        "ring" => Ok(Message::Ring),
+        "ring_stop" => Ok(Message::RingStop),
+        _ => Err("unknown ring action"),
+    }
+}
+
 /// App state for the link. `server` is `None` if it could not start.
 pub struct Link {
     server: Option<LinkServer>,
@@ -204,6 +215,7 @@ impl Link {
             phones,
             notifications: s.notifications.iter().cloned().collect(),
             call: s.call.clone(),
+            ring_secs: link::protocol::RING_SECS,
         }
     }
 
@@ -311,6 +323,24 @@ impl Link {
             return Err("there is no ringing call".into());
         }
         if server.send_to(phone, Message::CallAction { action: kind }) {
+            Ok(())
+        } else {
+            Err("this phone is not connected".into())
+        }
+    }
+
+    /// Start or stop ringing a connected phone (Find my phone).
+    ///
+    /// `action` is `ring` or `ring_stop`. The phone rings at alarm volume until
+    /// `ring_stop` arrives, its "Found it" button is pressed, or 60 seconds pass.
+    /// The window shows Stop while ringing and reverts after that timeout.
+    pub fn ring_phone(&self, id: &str, action: &str) -> Result<(), String> {
+        let msg = ring_message(action).map_err(str::to_string)?;
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        if server.send_to(id, msg) {
             Ok(())
         } else {
             Err("this phone is not connected".into())
@@ -662,7 +692,7 @@ fn handle_event(
 mod tests {
     use super::{Link, NotificationView, Shared};
     use seam_core::link::protocol::CallState;
-    use seam_core::link::{LinkServer, PhoneNotification};
+    use seam_core::link::{LinkServer, Message, PhoneNotification};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -1122,6 +1152,59 @@ mod tests {
         assert_eq!(
             link.status().call.as_ref().map(|c| c.caller.as_str()),
             Some("Anna")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ring_phone_sends_ring_or_ring_stop_only_when_connected() {
+        assert_eq!(super::ring_message("ring").unwrap(), Message::Ring);
+        assert_eq!(
+            super::ring_message("ring").unwrap().to_line(),
+            r#"{"type":"ring"}"#,
+        );
+        assert_eq!(super::ring_message("ring_stop").unwrap(), Message::RingStop);
+        assert_eq!(
+            super::ring_message("ring_stop").unwrap().to_line(),
+            r#"{"type":"ring_stop"}"#,
+        );
+        assert_eq!(
+            super::ring_message("stop").unwrap_err(),
+            "unknown ring action"
+        );
+        assert_eq!(super::ring_message("").unwrap_err(), "unknown ring action");
+
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            serde_json::to_value(offline.status()).unwrap()["ring_secs"],
+            60
+        );
+        assert_eq!(
+            offline.ring_phone("phone-a", "nope").unwrap_err(),
+            "unknown ring action"
+        );
+        assert_eq!(
+            offline.ring_phone("phone-a", "ring").unwrap_err(),
+            "the phone link is not running"
+        );
+
+        let dir = std::env::temp_dir().join(format!("seam-ring-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Test Desktop".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            link.ring_phone("phone-a", "ring").unwrap_err(),
+            "this phone is not connected"
+        );
+        assert_eq!(
+            link.ring_phone("phone-a", "ring_stop").unwrap_err(),
+            "this phone is not connected"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -12,6 +12,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 1024 * 1024;
 /// Longest notification reply, in Unicode scalar values (not bytes).
 pub const MAX_REPLY_CHARS: usize = 5_000;
+/// How long the phone rings after `ring` before stopping on its own.
+pub const RING_SECS: u64 = 60;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -133,6 +135,10 @@ pub enum Message {
     CallAction {
         action: CallActionKind,
     },
+    /// Desktop → phone: ring loudly until `ring_stop`, "Found it" on the phone, or 60 seconds.
+    Ring,
+    /// Desktop → phone: stop the loud ring.
+    RingStop,
     /// Either direction: offer a file. `transfer` is 32 hex chars; `size` is at most 2 GiB.
     FileOffer {
         transfer: String,
@@ -640,6 +646,21 @@ mod tests {
             Message::CallAction {
                 action: CallActionKind::Unknown,
             }
+        );
+    }
+
+    #[test]
+    fn ring_and_ring_stop_round_trip() {
+        assert_eq!(RING_SECS, 60);
+        assert_eq!(Message::Ring.to_line(), r#"{"type":"ring"}"#);
+        assert_eq!(
+            Message::from_line(r#"{"type":"ring"}"#).unwrap(),
+            Message::Ring
+        );
+        assert_eq!(Message::RingStop.to_line(), r#"{"type":"ring_stop"}"#);
+        assert_eq!(
+            Message::from_line(r#"{"type":"ring_stop"}"#).unwrap(),
+            Message::RingStop
         );
     }
 

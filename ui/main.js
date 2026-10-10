@@ -351,8 +351,47 @@ function renderCall(call) {
   box.hidden = false;
 }
 
+// Find my phone. The phone rings until Stop, its "Found it" button, or ring_secs.
+const RING_FALLBACK_MS = 60000;
+const ringingPhones = new Map();
+
+function stopRinging(id) {
+  const state = ringingPhones.get(id);
+  if (!state) return;
+  clearTimeout(state.timer);
+  ringingPhones.delete(id);
+}
+
+function ringDurationMs() {
+  const secs = lastLink && Number(lastLink.ring_secs);
+  return secs > 0 ? secs * 1000 : RING_FALLBACK_MS;
+}
+
+function beginRinging(id) {
+  stopRinging(id);
+  const timer = setTimeout(() => {
+    if (!ringingPhones.has(id)) return;
+    ringingPhones.delete(id);
+    invoke("ring_phone", { id, action: "ring_stop" }).catch(() => {});
+    if (lastLink) renderLink(lastLink);
+  }, ringDurationMs());
+  ringingPhones.set(id, { timer });
+}
+
+function isRinging(id) {
+  return ringingPhones.has(id);
+}
+
+function pruneRinging(link) {
+  for (const id of [...ringingPhones.keys()]) {
+    const phone = link.phones.find((p) => p.id === id);
+    if (!phone || !phone.connected) stopRinging(id);
+  }
+}
+
 function renderLink(link) {
   lastLink = link;
+  pruneRinging(link);
   renderCall(link.call);
   const liveNotes = new Set(link.notifications.map((n) => noteKey(n.phone, n.id)));
   for (const [key, state] of composers) {
@@ -373,6 +412,28 @@ function renderLink(link) {
       });
       const buttons = [];
       if (p.connected) {
+        const ringing = isRinging(p.id);
+        const ring = el("button", {
+          type: "button",
+          className: ringing ? "secondary ring-stop" : "secondary",
+          textContent: ringing ? "Stop" : "Ring",
+          title: ringing ? "Stop ringing" : "Ring phone",
+        });
+        ring.addEventListener("click", async () => {
+          const stop = isRinging(p.id);
+          ring.disabled = true;
+          try {
+            await invoke("ring_phone", { id: p.id, action: stop ? "ring_stop" : "ring" });
+            if (stop) stopRinging(p.id);
+            else beginRinging(p.id);
+            showLinkError(null);
+            if (lastLink) renderLink(lastLink);
+          } catch (e) {
+            showLinkError(String(e));
+          } finally {
+            ring.disabled = false;
+          }
+        });
         const send = el("button", {
           type: "button",
           className: "secondary",
@@ -391,7 +452,7 @@ function renderLink(link) {
             send.disabled = false;
           }
         });
-        buttons.push(send);
+        buttons.push(ring, send);
       }
       buttons.push(forget);
       return el(

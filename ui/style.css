@@ -19,7 +19,7 @@ h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
 h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 22px 0 8px; }
 ul { list-style: none; margin: 0; padding: 0; }
 .device {
-  display: flex; align-items: center; gap: 12px; padding: 12px 14px; margin-bottom: 8px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px 14px; margin-bottom: 8px;
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
 }
 .device .info { flex: 1; min-width: 0; }
@@ -40,6 +40,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-head h2 { margin-bottom: 8px; }
 button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+button.ring-stop { color: var(--warn); border-color: var(--warn); }
 button.link { background: transparent; color: var(--muted); padding: 4px 8px; font-weight: 500; }
 .pairing {
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
