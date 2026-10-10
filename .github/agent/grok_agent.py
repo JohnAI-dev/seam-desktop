@@ -79,7 +79,9 @@ def grok(system, user):
             print(f"Grok API call failed ({e}); retrying", flush=True)
         time.sleep(15 * (attempt + 1))
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
-    return json.loads(text)
+    # Take the first complete JSON object; ignore anything Grok adds after it.
+    obj, _ = json.JSONDecoder().raw_decode(text[text.index("{"):])
+    return obj
 
 
 def read_stream(response):
@@ -249,7 +251,7 @@ def main():
             continue
         ok, test_out = run_tests()
         sh("git", "add", "-A")
-        diff = sh("git", "diff", "--cached", "--", ".", ":!Cargo.lock").stdout[:60000]
+        diff = sh("git", "diff", "--cached", "--", ".", ":!Cargo.lock").stdout[:150000]
         print(f"tests {'passed' if ok else 'FAILED'}\n{test_out}", flush=True)
         if not ok:
             feedback = f"Tests failed:\n{test_out}\n\nYour diff was:\n{diff}"
