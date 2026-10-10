@@ -20,10 +20,10 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
       - name: Install system libraries
         run: bash scripts/install-deps.sh
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249  # stable
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
       - name: Test (format, lint, unit tests, build, launch app)
         run: bash scripts/test.sh
       - name: Commit Cargo.lock if it changed
