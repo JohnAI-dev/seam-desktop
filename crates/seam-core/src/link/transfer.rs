@@ -47,31 +47,81 @@ impl std::fmt::Display for TransferError {
 
 impl std::error::Error for TransferError {}
 
+fn is_unsafe_name_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0000}'..='\u{001F}' | '\u{007F}' | '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'
+    )
+}
+
+/// `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, and `LPT1`-`LPT9`, ignoring case.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    let stem = stem.to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    let bytes = stem.as_bytes();
+    bytes.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && matches!(bytes[3], b'1'..=b'9')
+}
+
 /// Reduce `name` to a single file name that cannot escape a directory.
 ///
 /// Both `/` and `\` are separators. The final segment is kept; `..`, `.` and leading
-/// dots are stripped. An empty result becomes `file`. Longer than [`MAX_NAME_CHARS`]
-/// is truncated without dropping the extension (the suffix after the last dot).
+/// dots are stripped. Control characters (U+0000-U+001F, U+007F), `:`, and `<>"|?*`
+/// are removed, and trailing dots and spaces are stripped. Longer than
+/// [`MAX_NAME_CHARS`] is truncated without dropping the extension (the suffix after
+/// the last dot). A Windows reserved device name (the stem before the first dot,
+/// case-insensitive) is prefixed with `_` after that truncation, so a shortened stem
+/// cannot be left as `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, or `LPT1`-`LPT9`.
+/// The extra `_` is truncated again if it would exceed the cap. An empty result
+/// becomes `file`.
 pub fn sanitize_name(name: &str) -> String {
     let base = name
         .rsplit(['/', '\\'])
         .find(|part| !part.is_empty())
         .unwrap_or("");
-    let base: String = base
-        .trim_start_matches('.')
-        .chars()
-        .filter(|c| !matches!(*c, '\0' | '/' | '\\'))
-        .collect();
-    let out = if base.is_empty() {
-        "file".to_string()
-    } else {
-        truncate_name(&base, MAX_NAME_CHARS)
-    };
+    let base: String = base.chars().filter(|c| !is_unsafe_name_char(*c)).collect();
+    let base = base.trim_start_matches('.').trim_end_matches(['.', ' ']);
+    let base = if base.is_empty() { "file" } else { base };
+    let truncated = truncate_name(base, MAX_NAME_CHARS);
+    let out = prefix_reserved_stem(&truncated);
     debug_assert!(!out.is_empty());
     debug_assert!(out.chars().count() <= MAX_NAME_CHARS);
     debug_assert!(!out.starts_with('.'));
-    debug_assert!(!out.contains('/') && !out.contains('\\'));
+    debug_assert!(!out.ends_with('.') && !out.ends_with(' '));
+    debug_assert!(out.chars().all(|c| !is_unsafe_name_char(c)));
+    debug_assert!(!is_windows_reserved(&out));
     out
+}
+
+/// Prefix a Windows reserved stem on the basename left by truncation.
+///
+/// The check runs after truncation and trailing dot/space trimming. A long extension
+/// shortens the stem to its first few characters, which can be `CON` or `COM1`.
+/// Prefix `_`, then if that extra character exceeds [`MAX_NAME_CHARS`], truncate
+/// again. The refit stem starts with `_`, so it cannot be a device name.
+fn prefix_reserved_stem(name: &str) -> String {
+    let name = trim_trailing_dots_spaces(name);
+    if !is_windows_reserved(&name) {
+        return name;
+    }
+    let prefixed = format!("_{name}");
+    if prefixed.chars().count() <= MAX_NAME_CHARS {
+        return prefixed;
+    }
+    trim_trailing_dots_spaces(&truncate_name(&prefixed, MAX_NAME_CHARS))
+}
+
+fn trim_trailing_dots_spaces(name: &str) -> String {
+    let trimmed = name.trim_end_matches(['.', ' ']);
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn truncate_name(name: &str, max_chars: usize) -> String {
@@ -279,6 +329,77 @@ impl Receiver {
     }
 }
 
+/// `com.apple.quarantine` value: `0081;<hex unix time>;Seam;`.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+fn quarantine_value(unix_secs: u64) -> String {
+    format!("0081;{unix_secs:x};Seam;")
+}
+
+/// Arguments for `xattr -w com.apple.quarantine <value> -- <path>`.
+///
+/// `--` stops option parsing. Without it, a relative path whose last component
+/// starts with `-` is parsed as a flag and the quarantine attribute is skipped.
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+fn xattr_quarantine_args(value: &str, path: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        std::ffi::OsString::from("-w"),
+        std::ffi::OsString::from("com.apple.quarantine"),
+        std::ffi::OsString::from(value),
+        std::ffi::OsString::from("--"),
+        path.as_os_str().to_os_string(),
+    ]
+}
+
+/// Windows `Zone.Identifier` stream body (Internet zone / Mark of the Web).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+const ZONE_IDENTIFIER: &str = "[ZoneTransfer]\r\nZoneId=3";
+
+/// Mark `path` so the OS treats it like a browser download.
+///
+/// macOS sets `com.apple.quarantine`. Windows writes a `Zone.Identifier` alternate
+/// data stream. Linux does nothing. Failures are logged; the saved file is kept.
+pub(crate) fn mark_downloaded(path: &Path) {
+    if let Err(e) = apply_download_mark(path) {
+        eprintln!(
+            "Seam link: could not mark {} as a download: {e}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_download_mark(path: &Path) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let value = quarantine_value(now);
+    let status = std::process::Command::new("xattr")
+        .args(xattr_quarantine_args(&value, path))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("xattr exited with {status}"))
+    }
+}
+
+#[cfg(windows)]
+fn apply_download_mark(path: &Path) -> Result<(), String> {
+    let mut ads = path.as_os_str().to_os_string();
+    ads.push(":Zone.Identifier");
+    std::fs::write(ads, ZONE_IDENTIFIER).map_err(|e| e.to_string())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn apply_download_mark(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 /// One file being received. Chunks are written to a temp file as they arrive.
 ///
 /// Dropping this before [`Inbound::finish`] deletes the partial file.
@@ -366,6 +487,7 @@ impl Inbound {
         }
         fs::rename(&self.temp, &dest).map_err(|e| format!("could not save the file: {e}"))?;
         self.committed = true;
+        mark_downloaded(&dest);
         Ok(dest)
     }
 }
@@ -468,6 +590,178 @@ mod tests {
 
         let huge_ext = format!("a.{}", "e".repeat(250));
         assert_eq!(sanitize_name(&huge_ext).chars().count(), 200);
+    }
+
+    #[test]
+    fn sanitize_name_removes_unsafe_characters_and_reserved_devices() {
+        assert_eq!(sanitize_name("report.txt:evil"), "report.txtevil");
+        assert_eq!(sanitize_name("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_name("a."), "a");
+        // The audit example x\^Gy is x + BEL (U+0007) + y.
+        assert_eq!(sanitize_name("x\u{0007}y"), "xy");
+
+        for c in ['\u{0000}', '\u{0001}', '\u{0007}', '\u{001F}', '\u{007F}'] {
+            assert_eq!(sanitize_name(&format!("x{c}y")), "xy");
+        }
+        for c in ['<', '>', '"', '|', '?', '*', ':'] {
+            assert_eq!(sanitize_name(&format!("a{c}b")), "ab", "{c}");
+        }
+        assert_eq!(sanitize_name("dir/report.txt:evil"), "report.txtevil");
+        assert_eq!(sanitize_name("a "), "a");
+        assert_eq!(sanitize_name("a. "), "a");
+        assert_eq!(sanitize_name("a ."), "a");
+        assert_eq!(sanitize_name("photo.jpg."), "photo.jpg");
+        assert_eq!(sanitize_name("photo.jpg "), "photo.jpg");
+        assert_eq!(sanitize_name("CON."), "_CON");
+        assert_eq!(sanitize_name("CON.txt."), "_CON.txt");
+        assert_eq!(sanitize_name("CON"), "_CON");
+        assert_eq!(sanitize_name("PRN"), "_PRN");
+        assert_eq!(sanitize_name("AUX"), "_AUX");
+        assert_eq!(sanitize_name("NUL"), "_NUL");
+        assert_eq!(sanitize_name("con.txt"), "_con.txt");
+        assert_eq!(sanitize_name("Aux.dat"), "_Aux.dat");
+        assert_eq!(sanitize_name("nul"), "_nul");
+        assert_eq!(sanitize_name("prn.TXT"), "_prn.TXT");
+        for n in 1..=9 {
+            assert_eq!(sanitize_name(&format!("COM{n}")), format!("_COM{n}"));
+            assert_eq!(
+                sanitize_name(&format!("com{n}.txt")),
+                format!("_com{n}.txt")
+            );
+            assert_eq!(
+                sanitize_name(&format!("LPT{n}.bin")),
+                format!("_LPT{n}.bin")
+            );
+            assert_eq!(sanitize_name(&format!("lpt{n}")), format!("_lpt{n}"));
+        }
+        assert_eq!(sanitize_name("COM0.txt"), "COM0.txt");
+        assert_eq!(sanitize_name("COM10.txt"), "COM10.txt");
+        assert_eq!(sanitize_name("LPT0"), "LPT0");
+        assert_eq!(sanitize_name("LPT10.txt"), "LPT10.txt");
+        assert_eq!(sanitize_name("COM.txt"), "COM.txt");
+        assert_eq!(sanitize_name("CONIN$.txt"), "CONIN$.txt");
+        assert_eq!(sanitize_name("file.CON"), "file.CON");
+        assert_eq!(sanitize_name("AUX.tar.gz"), "_AUX.tar.gz");
+        assert_eq!(sanitize_name(".CON.txt"), "_CON.txt");
+    }
+
+    #[test]
+    fn truncation_cannot_leave_a_windows_reserved_stem() {
+        // truncate_name keeps the suffix after the last dot. A 196-char extension
+        // (plus the dot) leaves a 3-char stem; 195 leaves 4. Those characters are
+        // the start of the attacker-controlled stem, so the reserved check has to
+        // run on the basename after truncation. Prefixing '_' can exceed the cap.
+        assert_eq!(MAX_NAME_CHARS, 200);
+        let ext3 = "e".repeat(MAX_NAME_CHARS - 3 - 1);
+        assert_eq!(ext3.chars().count(), 196);
+        for reserved in ["CON", "PRN", "AUX", "NUL", "con", "Prn"] {
+            let name = format!("{reserved}padding.{ext3}");
+            let got = sanitize_name(&name);
+            let mut expected = String::from("_");
+            expected.push_str(&reserved[..2]);
+            expected.push('.');
+            expected.push_str(&ext3);
+            assert_eq!(got, expected, "{reserved}");
+            assert_eq!(got.chars().count(), MAX_NAME_CHARS);
+            assert!(!is_windows_reserved(&got), "{got}");
+        }
+        let at_cap = sanitize_name(&format!("CON.{ext3}"));
+        let mut expected = String::from("_CO.");
+        expected.push_str(&ext3);
+        assert_eq!(at_cap, expected);
+        assert_eq!(at_cap.chars().count(), MAX_NAME_CHARS);
+        assert!(!is_windows_reserved(&at_cap));
+
+        let ext4 = "e".repeat(MAX_NAME_CHARS - 4 - 1);
+        assert_eq!(ext4.chars().count(), 195);
+        for n in 1..=9 {
+            for kind in ["COM", "LPT", "com", "lpt"] {
+                let reserved = format!("{kind}{n}");
+                let name = format!("{reserved}padding.{ext4}");
+                let got = sanitize_name(&name);
+                let mut expected = String::from("_");
+                expected.push_str(&reserved[..3]);
+                expected.push('.');
+                expected.push_str(&ext4);
+                assert_eq!(got, expected, "{reserved}");
+                assert_eq!(got.chars().count(), MAX_NAME_CHARS);
+                assert!(!is_windows_reserved(&got), "{got}");
+            }
+        }
+
+        assert_eq!(
+            sanitize_name(&format!("photo-padding.{ext3}")),
+            format!("pho.{ext3}")
+        );
+
+        // Truncation of a name with no dot can expose trailing spaces. Windows
+        // strips those, so the reserved check must see the trimmed basename.
+        for reserved in ["CON", "PRN", "AUX", "NUL", "COM1", "LPT9", "com1"] {
+            let mut spaced = reserved.to_string();
+            spaced.push_str(&" ".repeat(MAX_NAME_CHARS));
+            spaced.push_str("tail");
+            assert_eq!(
+                sanitize_name(&spaced),
+                format!("_{reserved}"),
+                "spaces exposed by truncation must not hide a device name"
+            );
+        }
+        let mut photo = String::from("photo");
+        photo.push_str(&" ".repeat(MAX_NAME_CHARS));
+        photo.push_str("tail");
+        assert_eq!(sanitize_name(&photo), "photo");
+    }
+
+    #[test]
+    fn quarantine_value_format() {
+        assert_eq!(quarantine_value(0), "0081;0;Seam;");
+        assert_eq!(quarantine_value(0x5f), "0081;5f;Seam;");
+        assert_eq!(quarantine_value(0xabcdef), "0081;abcdef;Seam;");
+        let now = 1_711_111_111u64;
+        assert_eq!(quarantine_value(now), format!("0081;{now:x};Seam;"));
+        assert!(quarantine_value(now).starts_with("0081;"));
+        assert!(quarantine_value(now).ends_with(";Seam;"));
+        assert_eq!(ZONE_IDENTIFIER, "[ZoneTransfer]\r\nZoneId=3");
+        assert!(ZONE_IDENTIFIER.contains("\r\n"));
+        assert!(!ZONE_IDENTIFIER.contains("ZoneId=2"));
+    }
+
+    #[test]
+    fn xattr_quarantine_args_stop_before_a_dash_name() {
+        let path = std::path::Path::new("-notes.txt");
+        let args = xattr_quarantine_args("0081;5f;Seam;", path);
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0].as_os_str(), std::ffi::OsStr::new("-w"));
+        assert_eq!(
+            args[1].as_os_str(),
+            std::ffi::OsStr::new("com.apple.quarantine")
+        );
+        assert_eq!(args[2].as_os_str(), std::ffi::OsStr::new("0081;5f;Seam;"));
+        assert_eq!(args[3].as_os_str(), std::ffi::OsStr::new("--"));
+        assert_eq!(args[4].as_os_str(), path.as_os_str());
+
+        let nested = std::path::Path::new("downloads").join("-report.txt");
+        let nested_args = xattr_quarantine_args("0081;0;Seam;", &nested);
+        assert_eq!(
+            nested_args[nested_args.len() - 2].as_os_str(),
+            std::ffi::OsStr::new("--")
+        );
+        assert_eq!(nested_args.last().unwrap().as_os_str(), nested.as_os_str());
+        assert_eq!(
+            nested.file_name().and_then(|name| name.to_str()),
+            Some("-report.txt")
+        );
+    }
+
+    #[test]
+    fn mark_downloaded_leaves_the_saved_bytes_in_place() {
+        let dir = scratch("mark");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        mark_downloaded(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello");
+        assert!(path.is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

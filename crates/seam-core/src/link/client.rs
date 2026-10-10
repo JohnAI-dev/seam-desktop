@@ -78,6 +78,28 @@ impl ServerCertVerifier for PinnedCert {
     }
 }
 
+/// Open a TLS connection pinned to the certificate fingerprint in `info`.
+pub(crate) async fn connect_tls(
+    info: &PairingInfo,
+    host: &str,
+) -> io::Result<TlsStream<TcpStream>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(io::Error::other)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedCert {
+            fingerprint: info.fingerprint.clone(),
+            provider,
+        }))
+        .with_no_client_auth();
+    let tcp = TcpStream::connect((host, info.port)).await?;
+    let server_name = ServerName::try_from("seam.local").expect("valid name");
+    TlsConnector::from(Arc::new(config))
+        .connect(server_name, tcp)
+        .await
+}
+
 /// A connected, authenticated phone session.
 pub struct PhoneClient {
     writer: WriteHalf<TlsStream<TcpStream>>,
@@ -96,21 +118,7 @@ impl PhoneClient {
         device_id: &str,
         name: &str,
     ) -> io::Result<Self> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(io::Error::other)?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedCert {
-                fingerprint: info.fingerprint.clone(),
-                provider,
-            }))
-            .with_no_client_auth();
-        let tcp = TcpStream::connect((host, info.port)).await?;
-        let server_name = ServerName::try_from("seam.local").expect("valid name");
-        let tls = TlsConnector::from(Arc::new(config))
-            .connect(server_name, tcp)
-            .await?;
+        let tls = connect_tls(info, host).await?;
         let (read_half, writer) = tokio::io::split(tls);
         let (frames, reader) = spawn_reader(read_half);
         let mut client = Self {
