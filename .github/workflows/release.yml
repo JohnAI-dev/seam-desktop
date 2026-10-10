@@ -164,7 +164,16 @@ jobs:
           adb and scrcpy are built in; nothing else to install.
           NOTES
           sed -i 's/^          //' notes.md
-          url=$(gh release create "$tag" "${files[@]}" --repo ${{ github.repository }} --target "$SHA" \
-                --title "Seam $VERSION" --notes-file notes.md --latest)
+          if [ "$(printf "%s\n" "${files[@]}" | xargs -n1 basename | sort | uniq -d)" ]; then
+            echo "::error title=Duplicate asset names::$(printf "%s\n" "${files[@]}" | xargs -n1 basename | sort | uniq -d | tr '\n' ' ')"
+          fi
+          for try in 1 2 3; do
+            if url=$(gh release create "$tag" "${files[@]}" --repo ${{ github.repository }} --target "$SHA" \
+                  --title "Seam $VERSION" --notes-file notes.md --latest 2>err.txt); then break; fi
+            echo "::warning title=Release attempt $try failed::$(tr '\n' ' ' < err.txt | cut -c1-500)"
+            gh release delete "$tag" --repo ${{ github.repository }} --yes --cleanup-tag 2>/dev/null || true
+            [ $try = 3 ] && { echo "::error title=Release failed::$(tr '\n' ' ' < err.txt | cut -c1-500)"; exit 1; }
+            sleep 20
+          done
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "Released: $url"
