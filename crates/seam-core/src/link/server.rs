@@ -28,6 +28,10 @@ pub const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
 /// How often the desktop pings a connected phone.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Connections that have not finished the handshake (through `welcome`).
+const MAX_UNAUTHENTICATED: usize = 16;
+/// Largest frame accepted before `welcome`. The hello frame is small.
+const PRE_AUTH_MAX_FRAME: usize = 4 * 1024;
 /// How long to wait for `file_accept` or `file_reject`.
 const FILE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to wait for `file_result` after `file_done`.
@@ -125,6 +129,8 @@ struct Inner {
     outbound: Mutex<HashMap<String, OutboundSlot>>,
     /// Folder received files are moved into. Temp files live here too.
     download_dir: PathBuf,
+    /// Connections that have not completed the handshake.
+    unauth: Mutex<usize>,
 }
 
 /// The link server. Cheap to clone; all clones share state.
@@ -166,6 +172,7 @@ impl LinkServer {
             file_outs: Mutex::new(HashMap::new()),
             outbound: Mutex::new(HashMap::new()),
             download_dir,
+            unauth: Mutex::new(0),
         };
         Ok((
             Self {
@@ -383,31 +390,50 @@ impl LinkServer {
     }
 
     /// Accept phones forever.
+    ///
+    /// At most 16 connections that have not finished the handshake are kept.
+    /// Extra sockets are closed immediately.
     pub async fn serve(self, listener: TcpListener) {
         loop {
             let Ok((tcp, addr)) = listener.accept().await else {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 continue;
             };
+            let Some(admission) = self.try_admit() else {
+                drop(tcp);
+                continue;
+            };
             let server = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = server.handle(tcp).await {
+                if let Err(e) = server.handle(tcp, admission).await {
                     eprintln!("Seam link: connection from {addr} ended: {e}");
                 }
             });
         }
     }
 
-    async fn handle(&self, tcp: TcpStream) -> io::Result<()> {
+    /// Reserve a slot for a connection that has not finished the handshake.
+    fn try_admit(&self) -> Option<UnauthGuard> {
+        let mut n = self.inner.unauth.lock().unwrap();
+        if *n >= MAX_UNAUTHENTICATED {
+            return None;
+        }
+        *n += 1;
+        Some(UnauthGuard {
+            server: self.clone(),
+            held: true,
+        })
+    }
+
+    async fn handle(&self, tcp: TcpStream, mut admission: UnauthGuard) -> io::Result<()> {
         let _ = tcp.set_nodelay(true);
         let tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.inner.acceptor.accept(tcp))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
         let (read_half, mut writer) = tokio::io::split(tls);
-        let (mut frames, reader) = spawn_reader(read_half);
-        // The reader task owns half of the connection; stop it when we're done so the
-        // connection really closes.
-        let _abort_reader = AbortOnDrop(reader);
+        // Before welcome, only a small frame is accepted. The hello is tiny; a large
+        // line is closed here so it never reaches the 1 MiB session reader.
+        let mut pre_auth = BufReader::new(read_half);
 
         let mut nonce = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -421,16 +447,29 @@ impl LinkServer {
         )
         .await?;
 
-        let hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, frames.recv())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no hello"))?;
-        let Some(Ok(Message::Hello {
-            device_id,
-            name,
-            proof,
-        })) = hello
-        else {
-            return reject(&mut writer, "expected hello").await;
+        let hello_line = match tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            read_limited_line(&mut pre_auth, PRE_AUTH_MAX_FRAME),
+        )
+        .await
+        {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => {
+                let _ = writer.shutdown().await;
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = writer.shutdown().await;
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "no hello"));
+            }
+        };
+        let (device_id, name, proof) = match Message::from_line(&hello_line) {
+            Ok(Message::Hello {
+                device_id,
+                name,
+                proof,
+            }) => (device_id, name, proof),
+            _ => return reject(&mut writer, "expected hello").await,
         };
 
         match self.authenticate(&device_id, &name, &nonce, &proof) {
@@ -445,6 +484,9 @@ impl LinkServer {
             Err(reason) => return reject(&mut writer, reason).await,
         }
 
+        // Authenticated: this connection no longer counts toward the pre-auth limit.
+        // Later frames use the normal 1 MiB reader.
+        admission.release();
         send(
             &mut writer,
             &Message::Welcome {
@@ -456,6 +498,11 @@ impl LinkServer {
             device_id: device_id.clone(),
             name,
         });
+
+        let (mut frames, reader) = spawn_reader(pre_auth);
+        // The reader task owns half of the connection; stop it when we're done so the
+        // connection really closes.
+        let _abort_reader = AbortOnDrop(reader);
 
         let (out_tx, mut outbox) = mpsc::unbounded_channel();
         let (file_tx, mut file_out) = mpsc::channel(FILE_QUEUE);
@@ -1006,6 +1053,29 @@ impl Drop for SendJob {
     }
 }
 
+/// Holds one pre-auth connection slot until the handshake finishes or the task ends.
+struct UnauthGuard {
+    server: LinkServer,
+    held: bool,
+}
+
+impl UnauthGuard {
+    fn release(&mut self) {
+        if !self.held {
+            return;
+        }
+        self.held = false;
+        let mut n = self.server.inner.unauth.lock().unwrap();
+        *n = n.saturating_sub(1);
+    }
+}
+
+impl Drop for UnauthGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// Aborts a task when dropped.
 pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
@@ -1032,6 +1102,44 @@ async fn reject<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, reason: &str) -> io
     .await;
     let _ = w.shutdown().await;
     Err(io::Error::new(io::ErrorKind::PermissionDenied, reason))
+}
+
+/// Read one non-empty line, refusing anything longer than `limit` bytes.
+async fn read_limited_line<R>(reader: &mut R, limit: usize) -> io::Result<String>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let n = reader.read(&mut byte).await?;
+            if n == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+            if buf.len() > limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        if buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            ));
+        }
+        let line = String::from_utf8_lossy(&buf);
+        if line.trim().is_empty() {
+            continue;
+        }
+        return Ok(line.into_owned());
+    }
 }
 
 /// Read newline-delimited frames on a separate task, so reading never has to be
@@ -1093,6 +1201,7 @@ pub fn local_ip() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{LinkEvent, LinkServer, PhoneFileReply};
+    use crate::link::client::PhoneClient;
     use crate::link::store::PairedDevice;
     use crate::link::transfer::{Inbound, MAX_CHUNK_BYTES, MAX_FILE_BYTES};
     use crate::link::Message;
@@ -1100,7 +1209,8 @@ mod tests {
     use base64::Engine;
     use sha2::{Digest, Sha256};
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
     use tokio::sync::mpsc;
 
     fn scratch(label: &str) -> std::path::PathBuf {
@@ -1820,6 +1930,159 @@ mod tests {
         drop(frame_tx);
         drop(out_tx);
         drop(file_tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn at_most_sixteen_unauthenticated_slots() {
+        let dir = scratch("slots");
+        let (server, _events) = LinkServer::new(&dir, "Desk".into()).unwrap();
+        let mut slots = Vec::new();
+        for _ in 0..super::MAX_UNAUTHENTICATED {
+            slots.push(server.try_admit().expect("slot"));
+        }
+        assert!(server.try_admit().is_none());
+        assert_eq!(
+            *server.inner.unauth.lock().unwrap(),
+            super::MAX_UNAUTHENTICATED
+        );
+        slots.pop().unwrap().release();
+        let extra = server.try_admit().expect("a freed slot can be reused");
+        assert_eq!(
+            *server.inner.unauth.lock().unwrap(),
+            super::MAX_UNAUTHENTICATED
+        );
+        drop(extra);
+        assert_eq!(
+            *server.inner.unauth.lock().unwrap(),
+            super::MAX_UNAUTHENTICATED - 1
+        );
+        drop(slots);
+        assert_eq!(*server.inner.unauth.lock().unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn pre_auth_reader_rejects_lines_over_4_kib() {
+        let limit = super::PRE_AUTH_MAX_FRAME;
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut reader = tokio::io::BufReader::new(server);
+        let mut ok_line = vec![b'a'; limit - 1];
+        ok_line.push(b'\n');
+        client.write_all(&ok_line).await.unwrap();
+        let got = super::read_limited_line(&mut reader, limit).await.unwrap();
+        assert_eq!(got.trim().len(), limit - 1);
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let mut reader = tokio::io::BufReader::new(server);
+        let mut big = vec![b'b'; 10 * 1024];
+        big.push(b'\n');
+        tokio::spawn(async move {
+            let _ = client.write_all(&big).await;
+        });
+        let err = super::read_limited_line(&mut reader, limit)
+            .await
+            .expect_err("10 KiB line");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("frame too large"));
+    }
+
+    async fn wait_unauth(server: &LinkServer, want: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let have = *server.inner.unauth.lock().unwrap();
+            if have == want {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out waiting for {want} unauthenticated connections, have {have}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_unauth_limit_and_pre_auth_line() {
+        let dir = scratch("unauth");
+        let (server, _events) = LinkServer::new(&dir, "Desk".into()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(server.clone().serve(listener));
+
+        let mut held = Vec::new();
+        for _ in 0..super::MAX_UNAUTHENTICATED {
+            held.push(
+                TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .expect("connect"),
+            );
+        }
+        wait_unauth(&server, super::MAX_UNAUTHENTICATED).await;
+
+        let mut extra = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut byte))
+            .await
+            .expect("17th connection should be closed immediately")
+            .expect("read");
+        assert_eq!(n, 0, "extra unauthenticated connection must be closed");
+        assert_eq!(
+            *server.inner.unauth.lock().unwrap(),
+            super::MAX_UNAUTHENTICATED
+        );
+
+        drop(held);
+        drop(extra);
+        wait_unauth(&server, 0).await;
+
+        let info = server.start_pairing(vec!["127.0.0.1".into()], port);
+        let phone = tokio::time::timeout(
+            Duration::from_secs(5),
+            PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel"),
+        )
+        .await
+        .expect("timed out waiting for a real phone to connect")
+        .expect("server should accept a real phone once raw connections close");
+        assert_eq!(phone.desktop_name, "Desk");
+        phone.close().await;
+
+        let mut tls = crate::link::client::connect_tls(&info, "127.0.0.1")
+            .await
+            .expect("pinned tls");
+        let mut saw_newline = false;
+        let challenge_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !saw_newline && tokio::time::Instant::now() < challenge_deadline {
+            let mut b = [0u8; 1];
+            let n = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut b))
+                .await
+                .expect("timed out reading the challenge")
+                .expect("challenge");
+            assert_ne!(n, 0, "closed before challenge");
+            if b[0] == b'\n' {
+                saw_newline = true;
+            }
+        }
+        assert!(saw_newline, "expected the challenge line");
+
+        let mut big = vec![b'x'; 10 * 1024];
+        big.push(b'\n');
+        let write_closed = tls.write_all(&big).await.is_err();
+        if !write_closed {
+            let _ = tls.flush().await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut closed = false;
+            while tokio::time::Instant::now() < deadline {
+                let mut buf = [0u8; 256];
+                match tls.read(&mut buf).await {
+                    Ok(0) | Err(_) => {
+                        closed = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                }
+            }
+            assert!(closed, "a 10 KiB pre-auth line should close the connection");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
