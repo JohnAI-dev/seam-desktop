@@ -104,6 +104,13 @@ fn dismiss_notification(phone_link: State<link::Link>, phone: String, id: String
 }
 
 #[tauri::command]
+fn send_clipboard(phone_link: State<link::Link>, id: String) -> Result<(), String> {
+    // Synchronous commands already run on the main thread. Read the clipboard
+    // there; do not hop through run_on_main_thread and block on the result.
+    phone_link.send_clipboard(&id)
+}
+
+#[tauri::command]
 fn update_status(app: AppHandle, pending: State<updates::Updates>) -> updates::UpdateStatus {
     pending.status(&app.package_info().version.to_string())
 }
@@ -176,6 +183,7 @@ pub fn run() {
             start_pairing,
             forget_phone,
             dismiss_notification,
+            send_clipboard,
             update_status,
             restart_to_update,
             frontend_ready

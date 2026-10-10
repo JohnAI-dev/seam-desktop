@@ -81,13 +81,36 @@ function renderLink(link) {
         if (!confirm(`Forget ${p.name}? You'll need to pair it again.`)) return;
         try { await invoke("forget_phone", { id: p.id }); await refresh(); } catch (e) { showLinkError(String(e)); }
       });
+      const buttons = [];
+      if (p.connected) {
+        const send = el("button", {
+          type: "button",
+          className: "secondary",
+          textContent: "Send clipboard",
+        });
+        send.addEventListener("click", async () => {
+          send.disabled = true;
+          try {
+            await invoke("send_clipboard", { id: p.id });
+            showLinkError(null);
+            showLinkConfirm(`Clipboard sent to ${p.name}.`);
+          } catch (e) {
+            showLinkConfirm(null);
+            showLinkError(String(e));
+          } finally {
+            send.disabled = false;
+          }
+        });
+        buttons.push(send);
+      }
+      buttons.push(forget);
       return el(
         "li",
         { className: "device" },
         el("div", { className: "info" },
           el("div", { className: "name" }, el("span", { className: `dot${p.connected ? " on" : ""}` }), p.name),
           el("div", { className: "meta", textContent: meta })),
-        forget,
+        ...buttons,
       );
     }),
   );
@@ -138,12 +161,23 @@ function renderLink(link) {
   );
   document.getElementById("notif-empty").hidden = link.notifications.length > 0;
   showLinkError(link.error);
+  if (link.error) showLinkConfirm(null);
 }
 
 function showLinkError(msg) {
   const e = document.getElementById("link-error");
   e.textContent = msg || "";
   e.hidden = !msg;
+}
+
+let confirmTimer = null;
+function showLinkConfirm(msg) {
+  const e = document.getElementById("link-confirm");
+  if (!e) return;
+  e.textContent = msg || "";
+  e.hidden = !msg;
+  clearTimeout(confirmTimer);
+  if (msg) confirmTimer = setTimeout(() => showLinkConfirm(null), 4000);
 }
 
 let pairingTimer = null;
