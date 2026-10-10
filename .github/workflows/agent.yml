@@ -9,45 +9,61 @@ on:
   workflow_dispatch:
     inputs:
       issue:
-        description: Issue number to (re)run the agent on
-        required: true
+        description: Issue number to (re)run the agent on (empty = the next one waiting)
+        required: false
+  schedule:
+    # Safety net: picks up waiting issues if a chain was interrupted.
+    - cron: "23 * * * *"
 permissions:
   contents: write
   pull-requests: write
   issues: write
   actions: write
+# One agent at a time per repo. Extra triggers wait; anything dropped is picked up by
+# the "next" job or the hourly schedule, because waiting issues stay open with `agent`.
 concurrency:
-  group: agent-issue-${{ github.event.issue.number || inputs.issue }}
+  group: agent-${{ github.repository }}
   cancel-in-progress: false
 jobs:
-  wait-turn:
-    # Agents in one repo take turns (oldest first), so their changes never collide.
+  pick:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      github.event_name != 'issues' ||
       (github.event.sender.login == github.repository_owner &&
        github.event.issue.state == 'open' &&
        ((github.event.action == 'opened' && !contains(github.event.issue.labels.*.name, 'agent')) ||
         github.event.label.name == 'agent') &&
        !contains(github.event.issue.labels.*.name, 'no-agent'))
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    outputs:
+      issue: ${{ steps.pick.outputs.issue }}
     steps:
-      - name: Wait for earlier agent runs in this repo to finish
+      - name: Choose the issue to work on
+        id: pick
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_ISSUE: ${{ needs.pick.outputs.issue }}
         run: |
-          while true; do
-            older=$(gh api "repos/${{ github.repository }}/actions/workflows/agent.yml/runs?per_page=50" \
-              --jq "[.workflow_runs[] | select(.id < ${{ github.run_id }} and (.status == \"in_progress\" or .status == \"queued\" or .status == \"waiting\"))] | length")
-            [ "$older" = "0" ] && break
-            echo "Waiting for $older earlier agent run(s) to finish..."
-            sleep 30
+          set -euo pipefail
+          if [ -n "$EVENT_ISSUE" ]; then
+            state=$(gh api repos/${{ github.repository }}/issues/$EVENT_ISSUE --jq .state)
+            [ "$state" = open ] && echo "issue=$EVENT_ISSUE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Oldest open `agent` issue whose last agent attempt didn't end in a reported failure.
+          for n in $(gh api "repos/${{ github.repository }}/issues?state=open&labels=agent&sort=created&direction=asc&per_page=50"                        --jq '.[] | select(.pull_request == null) | select([.labels[].name] | index("no-agent") | not) | .number'); do
+            last=$(gh api "repos/${{ github.repository }}/issues/$n/comments?per_page=100" --jq '[.[] | select(.body | startswith("🤖"))] | last | .body // ""')
+            case "$last" in
+              "🤖 Grok agent could not"*|"🤖 Grok agent crashed"*|"🤖 xAI rejected"*|*"leaving it for a human"*|"🤖 Grok agent ran out of time"*) continue ;;
+            esac
+            echo "issue=$n" >> "$GITHUB_OUTPUT"; echo "picked #$n"; exit 0
           done
+          echo "nothing waiting"
 
   fix:
-    needs: wait-turn
+    needs: pick
+    if: needs.pick.outputs.issue != ''
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 150
     outputs:
       branch: ${{ steps.agent.outputs.branch }}
       pr: ${{ steps.agent.outputs.pr }}
@@ -61,12 +77,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Load issue for manual runs
-        if: github.event_name == 'workflow_dispatch'
+      - name: Load the issue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api repos/${{ github.repository }}/issues/${{ inputs.issue }} \
+          gh api repos/${{ github.repository }}/issues/${{ needs.pick.outputs.issue }} \
             | jq '{issue: .}' > "$RUNNER_TEMP/event.json"
           echo "GITHUB_EVENT_PATH=$RUNNER_TEMP/event.json" >> "$GITHUB_ENV"
       - name: Grok fixes and reviews
@@ -100,14 +115,39 @@ jobs:
     uses: ./.github/workflows/release.yml
 
   close-issue:
-    needs: [fix, release]
+    needs: [pick, fix, release]
     runs-on: ubuntu-latest
     steps:
       - name: Close the issue with a link to the release
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ github.event.issue.number || inputs.issue }}
+          ISSUE: ${{ needs.pick.outputs.issue }}
         run: |
           gh api repos/${{ github.repository }}/issues/$ISSUE/comments \
             -f body="🤖 Fixed in #${{ needs.fix.outputs.pr }}, merged and released: ${{ needs.release.outputs.url }}"
           gh api -X PATCH repos/${{ github.repository }}/issues/$ISSUE -f state=closed -f state_reason=completed
+
+  next:
+    # Hand over to the next waiting issue, whatever happened to this one.
+    needs: [pick, fix, test, merge, release, close-issue]
+    if: always() && needs.pick.result == 'success' && needs.pick.outputs.issue != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report a timeout
+        if: needs.fix.result == 'cancelled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/${{ needs.pick.outputs.issue }}/comments \
+            -f body="🤖 Grok agent ran out of time on this issue. Split it into smaller issues, or remove and re-add the \`agent\` label to try again."
+      - name: Report a change that did not make it through CI, merge or release
+        if: needs.fix.result == 'success' && needs.close-issue.result != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/${{ github.repository }}/issues/${{ needs.pick.outputs.issue }}/comments \
+            -f body="🤖 Grok agent could not finish: PR #${{ needs.fix.outputs.pr }} did not get through CI, merge or release (test: ${{ needs.test.result }}, merge: ${{ needs.merge.result }}). See ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      - name: Start the next waiting issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run agent.yml -R ${{ github.repository }} --ref main
