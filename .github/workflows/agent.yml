@@ -42,12 +42,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EXPLICIT_ISSUE: ${{ inputs.issue }}
-          # 3 runs per engineer: Grok, then (with an OpenRouter key) Claude and OpenAI.
-          MAX_FAILED_RUNS: ${{ secrets.OPENROUTER_API_KEY != '' && 9 || 3 }}
+          # Automatic runs per issue after a failed one (re-adding the `agent` label resets the count).
+          MAX_FAILED_RUNS: ${{ vars.AGENT_MAX_FAILED_RUNS || '1' }}
+          AGENT_BUDGET_DAY_USD: ${{ vars.AGENT_BUDGET_DAY_USD || '10' }}
         run: |
           set -euo pipefail
           R=${{ github.repository }}
-          # An explicit issue (manual run, or the agent restarting after a conflict) goes first.
+          # Daily budget: the agent records its spend on the agent-ledger branch (UTC days).
+          spent=$(gh api "repos/$R/contents/agent-ledger.json?ref=agent-ledger" --jq .content 2>/dev/null \
+                    | base64 -d 2>/dev/null | jq -r --arg d "$(date -u +%F)" '.days[$d] // 0' 2>/dev/null || true)
+          if awk -v s="${spent:-0}" -v l="$AGENT_BUDGET_DAY_USD" 'BEGIN { exit !(s + 0 >= l + 0) }'; then
+            echo "::notice title=Daily budget used up::\$${spent} of \$${AGENT_BUDGET_DAY_USD} today (UTC); nothing picked"
+            exit 0
+          fi
+          # An explicit issue (manual run) goes first.
           if [ -n "$EXPLICIT_ISSUE" ]; then
             [ "$(gh api repos/$R/issues/$EXPLICIT_ISSUE --jq .state)" = open ] && echo "issue=$EXPLICIT_ISSUE" >> "$GITHUB_OUTPUT"
             exit 0
@@ -66,13 +74,14 @@ jobs:
             last=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq '[.[] | select(.body | startswith("🤖"))] | last // {} | "\(.created_at // "")|\(.body // "")"')
             at=${last%%|*}; body=${last#*|}
             case "$body" in
-              "🤖 Grok agent could not"*|"🤖 Grok agent crashed"*|"🤖 xAI rejected"*|*"leaving it for a human"*|"🤖 Grok agent ran out of time"*)
+              "🤖 Grok agent could not"*|"🤖 Grok agent crashed"*|"🤖 xAI rejected"*|*"API rejected the key"*|*"leaving it for a human"*|"🤖 Grok agent ran out of time"*|"🤖 Grok agent stopped"*)
                 labeled=$(gh api "repos/$R/issues/$n/events?per_page=100" --jq '[.[] | select(.event == "labeled" and .label.name == "agent")] | last | .created_at // ""')
                 if [[ ! "$labeled" > "$at" ]]; then
                   # Grok gave up after all attempts: continue automatically (from the saved attempt)
-                  # until every engineer has had its 3 runs (see MAX_FAILED_RUNS).
-                  fails=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq "[.[] | select(.created_at > \"$labeled\") | select(.body | startswith(\"🤖 Grok agent could not\"))] | length")
-                  case "$body" in "🤖 Grok agent could not"*) [ "$fails" -lt "$MAX_FAILED_RUNS" ] || continue ;; *) continue ;; esac
+                  # at most MAX_FAILED_RUNS times. Anything else (CI/merge failures, crashes,
+                  # timeouts, budget stops, conflicts) waits for a human to re-add the label.
+                  fails=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq "[.[] | select(.created_at > \"$labeled\") | select(.body | startswith(\"🤖 Grok agent could not produce\"))] | length")
+                  case "$body" in "🤖 Grok agent could not produce"*) [ "$fails" -lt "$MAX_FAILED_RUNS" ] || continue ;; *) continue ;; esac
                 fi ;;
             esac
             echo "issue=$n" >> "$GITHUB_OUTPUT"; echo "picked #$n"; exit 0
@@ -123,7 +132,13 @@ jobs:
           XAI_MODEL: ${{ vars.XAI_MODEL }}
           CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
-          AGENT_MAX_ATTEMPTS: "8"
+          XAI_REVIEW_MODEL: ${{ vars.XAI_REVIEW_MODEL }}
+          XAI_SELECT_MODEL: ${{ vars.XAI_SELECT_MODEL }}
+          AGENT_MAX_ATTEMPTS: ${{ vars.AGENT_MAX_ATTEMPTS || '3' }}
+          AGENT_REASONING_EFFORT: ${{ vars.AGENT_REASONING_EFFORT || 'medium' }}
+          AGENT_MAX_CONTEXT_BYTES: ${{ vars.AGENT_MAX_CONTEXT_BYTES || '80000' }}
+          AGENT_BUDGET_ISSUE_USD: ${{ vars.AGENT_BUDGET_ISSUE_USD || '2' }}
+          AGENT_BUDGET_DAY_USD: ${{ vars.AGENT_BUDGET_DAY_USD || '10' }}
         run: python3 .github/agent/grok_agent.py
 
   test:

@@ -42,3 +42,19 @@ They are unsigned for now (Mac: right-click → Open the first time).
 - Secret `XAI_API_KEY`: your xAI API key. Variable `XAI_MODEL` (optional): defaults to `grok-4.7`.
 - Settings → Actions → General → Workflow permissions: *Read and write* and
   *Allow GitHub Actions to create and approve pull requests*.
+
+## Agent cost controls
+
+Every LLM call logs its tokens and cost (from the API's own usage report) in the job log and
+the job summary, and the spend is recorded on the `agent-ledger` branch. Repository variables
+(Settings → Secrets and variables → Actions → Variables) tune it; defaults in brackets:
+
+- `AGENT_BUDGET_ISSUE_USD` [2]: no new call once an issue has used this. Re-adding the `agent`
+  label gives it a fresh budget.
+- `AGENT_BUDGET_DAY_USD` [10]: per repository and UTC day; waiting issues continue the next day.
+- `AGENT_MAX_ATTEMPTS` [3] per run, `AGENT_MAX_FAILED_RUNS` [1] automatic re-runs of a failed issue.
+  CI/merge failures, crashes, timeouts and budget stops wait for a human.
+- `AGENT_MAX_CONTEXT_BYTES` [80000]: the engineer sees the file tree plus the files named in the
+  issue and up to 12 picked by a cheap selection call, not the whole repository.
+- `AGENT_REASONING_EFFORT` [medium], `XAI_REVIEW_MODEL` / `XAI_SELECT_MODEL` [grok-build-0.1;
+  falls back to `XAI_MODEL` if unavailable].
