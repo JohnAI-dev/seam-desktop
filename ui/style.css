@@ -35,6 +35,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 .tools .missing { color: var(--warn); }
 .hint { color: var(--muted); }
 .error { color: var(--bad); }
+.confirm { color: var(--ok); }
 
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .section-head h2 { margin-bottom: 8px; }
