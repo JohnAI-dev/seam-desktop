@@ -12,6 +12,17 @@
     <p class="tagline">Your phone and your computer, as one.</p>
   </header>
 
+  <div id="call" class="call-banner" role="status" hidden>
+    <div class="call-info">
+      <div class="call-kicker">Incoming call</div>
+      <div id="call-caller" class="call-caller"></div>
+    </div>
+    <div class="call-actions">
+      <button id="call-decline" type="button" class="decline">Decline</button>
+      <button id="call-silence" type="button" class="secondary">Silence</button>
+    </div>
+  </div>
+
   <div id="update" class="update" role="status" hidden>
     <span id="update-text"></span>
     <button id="update-btn">Restart</button>

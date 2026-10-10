@@ -82,3 +82,16 @@ button.link { background: transparent; color: var(--muted); padding: 4px 8px; fo
 }
 .notifications .reply-sent { color: var(--ok); font-size: 13px; font-weight: 600; }
 .notifications .reply-error { margin-top: 4px; color: var(--bad); font-size: 13px; }
+.call-banner {
+  align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  margin: 0 0 16px; padding: 12px 14px; border-radius: 12px;
+  background: var(--card); border: 1px solid var(--bad);
+}
+.call-banner:not([hidden]) { display: flex; }
+.call-banner .call-info { flex: 1; min-width: 0; }
+.call-banner .call-kicker {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted);
+}
+.call-banner .call-caller { font-weight: 600; overflow-wrap: anywhere; }
+.call-banner .call-actions { display: flex; gap: 8px; flex: none; }
+.call-banner button.decline { background: var(--bad); color: var(--accent-fg); }

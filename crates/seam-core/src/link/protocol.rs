@@ -34,6 +34,46 @@ pub struct PhoneNotification {
     pub replyable: bool,
 }
 
+/// State of a phone call, as the phone reports it.
+///
+/// Unknown states are kept so a newer phone does not break the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallState {
+    Ringing,
+    Active,
+    Ended,
+    /// A state this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the computer asks the phone to do with a ringing call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallActionKind {
+    Decline,
+    Silence,
+    /// An action this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Who to show for a call: the contact name, otherwise the number, otherwise "Unknown caller".
+///
+/// Blank and whitespace-only fields are treated as missing.
+pub fn caller_label(name: &str, number: &str) -> String {
+    let name = name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    let number = number.trim();
+    if !number.is_empty() {
+        return number.to_string();
+    }
+    "Unknown caller".to_string()
+}
+
 /// One protocol frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -80,6 +120,18 @@ pub enum Message {
         ok: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// Phone → desktop: a call is ringing, active, or ended.
+    Call {
+        state: CallState,
+        #[serde(default)]
+        number: String,
+        #[serde(default)]
+        name: String,
+    },
+    /// Desktop → phone: decline the ringing call, or silence its ringtone.
+    CallAction {
+        action: CallActionKind,
     },
     Ping,
     Pong,
@@ -463,5 +515,101 @@ mod tests {
             normalize_reply_text(&"你".repeat(5_001)).unwrap_err(),
             "reply is too long"
         );
+    }
+
+    #[test]
+    fn call_and_call_action_round_trip() {
+        let ringing = Message::Call {
+            state: CallState::Ringing,
+            number: "+4712345678".into(),
+            name: "Anna".into(),
+        };
+        assert_eq!(
+            ringing.to_line(),
+            r#"{"type":"call","state":"ringing","number":"+4712345678","name":"Anna"}"#,
+        );
+        assert_eq!(Message::from_line(&ringing.to_line()).unwrap(), ringing);
+
+        let active = Message::Call {
+            state: CallState::Active,
+            number: String::new(),
+            name: "Anna".into(),
+        };
+        assert_eq!(
+            active.to_line(),
+            r#"{"type":"call","state":"active","number":"","name":"Anna"}"#,
+        );
+        assert_eq!(Message::from_line(&active.to_line()).unwrap(), active);
+
+        let ended = Message::Call {
+            state: CallState::Ended,
+            number: String::new(),
+            name: String::new(),
+        };
+        assert_eq!(
+            ended.to_line(),
+            r#"{"type":"call","state":"ended","number":"","name":""}"#,
+        );
+        assert_eq!(Message::from_line(&ended.to_line()).unwrap(), ended);
+
+        // number and name are optional on the wire; missing means empty.
+        assert_eq!(
+            Message::from_line(r#"{"type":"call","state":"ringing"}"#).unwrap(),
+            Message::Call {
+                state: CallState::Ringing,
+                number: String::new(),
+                name: String::new(),
+            }
+        );
+
+        let decline = Message::CallAction {
+            action: CallActionKind::Decline,
+        };
+        assert_eq!(
+            decline.to_line(),
+            r#"{"type":"call_action","action":"decline"}"#,
+        );
+        assert_eq!(Message::from_line(&decline.to_line()).unwrap(), decline);
+
+        let silence = Message::CallAction {
+            action: CallActionKind::Silence,
+        };
+        assert_eq!(
+            silence.to_line(),
+            r#"{"type":"call_action","action":"silence"}"#,
+        );
+        assert_eq!(Message::from_line(&silence.to_line()).unwrap(), silence);
+
+        // A newer phone's state or action must not fail the frame.
+        match Message::from_line(r#"{"type":"call","state":"holding","number":"1","name":"A"}"#)
+            .unwrap()
+        {
+            Message::Call {
+                state: CallState::Unknown,
+                number,
+                name,
+            } => {
+                assert_eq!(number, "1");
+                assert_eq!(name, "A");
+            }
+            other => panic!("expected call, got {other:?}"),
+        }
+        assert_eq!(
+            Message::from_line(r#"{"type":"call_action","action":"answer"}"#).unwrap(),
+            Message::CallAction {
+                action: CallActionKind::Unknown,
+            }
+        );
+    }
+
+    #[test]
+    fn caller_label_prefers_name_then_number_then_unknown() {
+        assert_eq!(caller_label("Anna", "+47123"), "Anna");
+        assert_eq!(caller_label("  Anna  ", "+47123"), "Anna");
+        assert_eq!(caller_label("", "+47123"), "+47123");
+        assert_eq!(caller_label("   ", "  +47 123  "), "+47 123");
+        assert_eq!(caller_label("", ""), "Unknown caller");
+        assert_eq!(caller_label("  ", " \t"), "Unknown caller");
+        assert_eq!(caller_label("\n", ""), "Unknown caller");
     }
 }

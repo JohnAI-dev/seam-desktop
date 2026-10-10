@@ -1,6 +1,7 @@
 //! End-to-end: a Rust "phone" pairs with the real link server over real TLS.
 
 use seam_core::link::client::PhoneClient;
+use seam_core::link::protocol::{CallActionKind, CallState};
 use seam_core::link::{LinkEvent, LinkServer, Message, PairingInfo, PhoneNotification};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -307,6 +308,98 @@ async fn desktop_reply_reaches_the_phone_as_the_exact_frame() {
             id: n.id,
             ok: false,
             error: Some("notification is gone".into()),
+        }
+    );
+}
+
+#[tokio::test]
+async fn phone_sends_a_ringing_call_and_receives_call_action() {
+    let (server, mut events, port) = start("call").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    phone
+        .send(&Message::Call {
+            state: CallState::Ringing,
+            number: "+4712345678".into(),
+            name: "Anna".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Call {
+            device_id: "phone-1".into(),
+            state: CallState::Ringing,
+            number: "+4712345678".into(),
+            name: "Anna".into(),
+        }
+    );
+
+    // Decline and Silence are the frames the window buttons send.
+    let decline = Message::CallAction {
+        action: CallActionKind::Decline,
+    };
+    assert!(server.send_to("phone-1", decline.clone()));
+    let got = tokio::time::timeout(Duration::from_secs(5), phone.recv())
+        .await
+        .expect("timed out waiting for the call_action frame")
+        .expect("phone connection closed before the call_action");
+    assert_eq!(
+        got.to_line(),
+        r#"{"type":"call_action","action":"decline"}"#,
+    );
+    assert_eq!(got, decline);
+
+    let silence = Message::CallAction {
+        action: CallActionKind::Silence,
+    };
+    assert!(server.send_to("phone-1", silence.clone()));
+    let got = tokio::time::timeout(Duration::from_secs(5), phone.recv())
+        .await
+        .expect("timed out waiting for the silence frame")
+        .expect("phone connection closed before silence");
+    assert_eq!(
+        got.to_line(),
+        r#"{"type":"call_action","action":"silence"}"#,
+    );
+    assert_eq!(got, silence);
+
+    phone
+        .send(&Message::Call {
+            state: CallState::Active,
+            number: "+4712345678".into(),
+            name: "Anna".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Call {
+            device_id: "phone-1".into(),
+            state: CallState::Active,
+            number: "+4712345678".into(),
+            name: "Anna".into(),
+        }
+    );
+    phone
+        .send(&Message::Call {
+            state: CallState::Ended,
+            number: String::new(),
+            name: String::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Call {
+            device_id: "phone-1".into(),
+            state: CallState::Ended,
+            number: String::new(),
+            name: String::new(),
         }
     );
 }
