@@ -41,19 +41,26 @@ jobs:
         id: pick
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_ISSUE: ${{ needs.pick.outputs.issue }}
+          EXPLICIT_ISSUE: ${{ inputs.issue }}
         run: |
           set -euo pipefail
-          if [ -n "$EVENT_ISSUE" ]; then
-            state=$(gh api repos/${{ github.repository }}/issues/$EVENT_ISSUE --jq .state)
-            [ "$state" = open ] && echo "issue=$EVENT_ISSUE" >> "$GITHUB_OUTPUT"
+          R=${{ github.repository }}
+          # An explicit issue (manual run, or the agent restarting after a conflict) goes first.
+          if [ -n "$EXPLICIT_ISSUE" ]; then
+            [ "$(gh api repos/$R/issues/$EXPLICIT_ISSUE --jq .state)" = open ] && echo "issue=$EXPLICIT_ISSUE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Oldest open `agent` issue whose last agent attempt didn't end in a reported failure.
-          for n in $(gh api "repos/${{ github.repository }}/issues?state=open&labels=agent&sort=created&direction=asc&per_page=50"                        --jq '.[] | select(.pull_request == null) | select([.labels[].name] | index("no-agent") | not) | .number'); do
-            last=$(gh api "repos/${{ github.repository }}/issues/$n/comments?per_page=100" --jq '[.[] | select(.body | startswith("🤖"))] | last | .body // ""')
-            case "$last" in
-              "🤖 Grok agent could not"*|"🤖 Grok agent crashed"*|"🤖 xAI rejected"*|*"leaving it for a human"*|"🤖 Grok agent ran out of time"*) continue ;;
+          # Otherwise the oldest open `agent` issue, so related issues run in the order they were filed.
+          # Skip issues whose last agent attempt ended in a reported failure, unless the `agent`
+          # label was (re-)added after that failure.
+          for n in $(gh api "repos/$R/issues?state=open&labels=agent&sort=created&direction=asc&per_page=50" \
+                       --jq '.[] | select(.pull_request == null) | select([.labels[].name] | index("no-agent") | not) | .number'); do
+            last=$(gh api "repos/$R/issues/$n/comments?per_page=100" --jq '[.[] | select(.body | startswith("🤖"))] | last // {} | "\(.created_at // "")|\(.body // "")"')
+            at=${last%%|*}; body=${last#*|}
+            case "$body" in
+              "🤖 Grok agent could not"*|"🤖 Grok agent crashed"*|"🤖 xAI rejected"*|*"leaving it for a human"*|"🤖 Grok agent ran out of time"*)
+                labeled=$(gh api "repos/$R/issues/$n/events?per_page=100" --jq '[.[] | select(.event == "labeled" and .label.name == "agent")] | last | .created_at // ""')
+                [[ "$labeled" > "$at" ]] || continue ;;
             esac
             echo "issue=$n" >> "$GITHUB_OUTPUT"; echo "picked #$n"; exit 0
           done
