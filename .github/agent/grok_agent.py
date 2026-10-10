@@ -211,7 +211,7 @@ def review_change(issue_text, diff, test_out):
 
 
 def main():
-    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+    event = json.loads(Path(os.environ.get("AGENT_EVENT_PATH") or os.environ["GITHUB_EVENT_PATH"]).read_text())
     issue = event["issue"]
     num, title, body = issue["number"], issue["title"], issue.get("body") or ""
     issue_text = f"Issue #{num}: {title}\n\n{body}"
@@ -317,7 +317,7 @@ def report_crash(exc):
     one_line = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:500]
     print(f"::error title=Grok agent crashed::{one_line}", flush=True)
     try:
-        num = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())["issue"]["number"]
+        num = json.loads(Path(os.environ.get("AGENT_EVENT_PATH") or os.environ["GITHUB_EVENT_PATH"]).read_text())["issue"]["number"]
         gh_api("POST", f"repos/{REPO}/issues/{num}/comments",
                {"body": f"🤖 Grok agent crashed:\n```\n{detail}\n```"})
     except Exception as e2:

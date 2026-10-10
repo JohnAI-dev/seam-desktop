@@ -83,7 +83,7 @@ jobs:
         run: |
           gh api repos/${{ github.repository }}/issues/${{ needs.pick.outputs.issue }} \
             | jq '{issue: .}' > "$RUNNER_TEMP/event.json"
-          echo "GITHUB_EVENT_PATH=$RUNNER_TEMP/event.json" >> "$GITHUB_ENV"
+          echo "AGENT_EVENT_PATH=$RUNNER_TEMP/event.json" >> "$GITHUB_ENV"
       - name: Grok fixes and reviews
         id: agent
         env:
