@@ -118,6 +118,8 @@ def llm(provider, system, user, model=None):
         extra = {"HTTP-Referer": f"https://github.com/{REPO}", "X-Title": "Seam agent"}
     else:
         url, extra = API_URL, {}
+    if "json" not in (system + user).lower():
+        system += "\nAnswer with a JSON object."  # OpenAI's JSON mode requires the word
     body = {"model": model, "stream": True, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     if provider == "xai":
