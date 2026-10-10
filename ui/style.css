@@ -69,3 +69,16 @@ button.link { background: transparent; color: var(--muted); padding: 4px 8px; fo
   background: var(--card); border: 1px solid var(--accent);
 }
 .version { color: var(--muted); font-size: 12px; margin-top: 28px; text-align: center; }
+.notifications .reply, .notifications .reply-wrap, .notifications .reply-sent, .notifications button.reply-btn { margin-top: 8px; }
+.notifications .reply { display: flex; gap: 6px; align-items: center; }
+.notifications .reply-wrap .reply, .notifications .reply-wrap button.reply-btn { margin-top: 0; }
+.notifications .reply input {
+  flex: 1; min-width: 0; font: inherit; padding: 5px 8px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg);
+}
+.notifications button.reply-btn, .notifications button.send {
+  background: transparent; color: var(--accent); border: 1px solid var(--line);
+  padding: 4px 10px; font-size: 13px; font-weight: 600;
+}
+.notifications .reply-sent { color: var(--ok); font-size: 13px; font-weight: 600; }
+.notifications .reply-error { margin-top: 4px; color: var(--bad); font-size: 13px; }
