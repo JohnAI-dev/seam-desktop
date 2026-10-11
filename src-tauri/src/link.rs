@@ -1,5 +1,9 @@
 //! The phone link inside the app: runs the server, keeps what the window shows,
 //! and turns phone notifications and incoming calls into notifications on this computer.
+//!
+//! Do Not Disturb (`dnd` from the phone) is shown next to the phone. While it is
+//! on, system popups for that phone's notifications are suppressed; they are still
+//! listed. "Silence phone" sends `dnd_set`.
 
 use seam_core::link::transfer::sanitize_name;
 use seam_core::link::{self, photos, LinkEvent, LinkServer, Message, PhoneNotification};
@@ -33,6 +37,9 @@ pub struct PhoneView {
     name: String,
     connected: bool,
     battery: Option<(u8, bool)>,
+    /// Phone's Do Not Disturb flag. Missing on older snapshots means off.
+    #[serde(default)]
+    dnd: bool,
 }
 
 /// One row in the phone-notification list.
@@ -298,6 +305,30 @@ impl Shared {
         let call_changed = self.clear_call(device_id);
         self.drop_unmatched_photo_requests(device_id);
         call_changed
+    }
+
+    /// Record this phone's Do Not Disturb flag. A phone not listed yet is added so
+    /// a `dnd` frame that arrives first is not lost. Other fields are left alone.
+    fn set_dnd_state(&mut self, device_id: &str, on: bool) {
+        if let Some(phone) = self.phones.get_mut(device_id) {
+            phone.dnd = on;
+            return;
+        }
+        self.phones.insert(
+            device_id.to_string(),
+            PhoneView {
+                id: device_id.to_string(),
+                name: device_id.to_string(),
+                connected: false,
+                battery: None,
+                dnd: on,
+            },
+        );
+    }
+
+    /// That phone's Do Not Disturb flag. Unknown phones are treated as off.
+    fn phone_dnd(&self, id: &str) -> bool {
+        self.phones.get(id).is_some_and(|phone| phone.dnd)
     }
 
     fn note_send_progress(
@@ -690,6 +721,21 @@ impl Link {
             .as_ref()
             .ok_or("the phone link is not running")?;
         if server.send_to(id, msg) {
+            Ok(())
+        } else {
+            Err("this phone is not connected".into())
+        }
+    }
+
+    /// Ask the phone to turn Do Not Disturb on or off (`dnd_set`).
+    ///
+    /// The window keeps the last `dnd` the phone reported until it sends a new one.
+    pub fn set_dnd(&self, phone: &str, on: bool) -> Result<(), String> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        if server.send_to(phone, Message::DndSet { on }) {
             Ok(())
         } else {
             Err("this phone is not connected".into())
@@ -1141,6 +1187,10 @@ fn desktop_name() -> String {
 
 /// Start the link server and its event loop. Never fails the app: problems are
 /// shown in the window instead.
+///
+/// `system_notifications` is false in the headless self-test, so popups are not
+/// attempted when there is no notification service. Do Not Disturb still suppresses
+/// a phone's notification popups when this is true.
 pub fn start(app: &AppHandle, system_notifications: bool) -> Link {
     let dir = match app.path().app_local_data_dir() {
         Ok(d) => d.join("link"),
@@ -1159,6 +1209,7 @@ pub fn start(app: &AppHandle, system_notifications: bool) -> Link {
                 name: d.name,
                 connected: false,
                 battery: None,
+                dnd: false,
             },
         );
     }
@@ -1314,6 +1365,7 @@ fn handle_event(
     let mut received_notice_text: Option<String> = None;
     let mut transfer_changed = false;
     let mut photos_changed = false;
+    let mut dnd_changed = false;
     let mut reveal_photo: Option<PathBuf> = None;
     {
         let mut s = shared.lock().unwrap();
@@ -1324,6 +1376,7 @@ fn handle_event(
                     name: name.clone(),
                     connected: false,
                     battery: None,
+                    dnd: false,
                 });
                 phone.name = name;
                 phone.connected = true;
@@ -1347,21 +1400,31 @@ fn handle_event(
                     p.battery = Some((level, charging));
                 }
             }
+            LinkEvent::Dnd { device_id, on } => {
+                s.set_dnd_state(&device_id, on);
+                dnd_changed = true;
+            }
             LinkEvent::Notification {
                 device_id,
                 notification,
             } => {
-                s.notifications
-                    .retain(|n| n.notification.id != notification.id);
-                s.notifications.push_front(NotificationView {
-                    phone: device_id,
-                    notification: notification.clone(),
-                    reply_seq: None,
-                    reply_ok: None,
-                    reply_error: None,
-                });
-                s.notifications.truncate(KEEP_NOTIFICATIONS);
-                show = Some(notification);
+                // Popup follows that phone's Do Not Disturb only. The window list does not.
+                let presentation = link::present_notification(s.phone_dnd(&device_id));
+                if presentation.list {
+                    s.notifications
+                        .retain(|n| n.notification.id != notification.id);
+                    s.notifications.push_front(NotificationView {
+                        phone: device_id,
+                        notification: notification.clone(),
+                        reply_seq: None,
+                        reply_ok: None,
+                        reply_error: None,
+                    });
+                    s.notifications.truncate(KEEP_NOTIFICATIONS);
+                }
+                if presentation.popup {
+                    show = Some(notification);
+                }
             }
             LinkEvent::NotificationRemoved { id, .. } => {
                 s.notifications.retain(|n| n.notification.id != id);
@@ -1501,6 +1564,9 @@ fn handle_event(
     }
     if photos_changed {
         let _ = app.emit("recent-photos", ());
+    }
+    if dnd_changed {
+        let _ = app.emit("dnd", ());
     }
     if let Some(path) = reveal_photo {
         // Finder/Explorer can be slow. Do not block the link event loop on it.
@@ -2066,6 +2132,7 @@ mod tests {
             name: name.to_string(),
             connected,
             battery: None,
+            dnd: false,
         }
     }
 
@@ -2604,6 +2671,7 @@ mod tests {
                 name: "Pixel".into(),
                 connected: true,
                 battery: None,
+                dnd: false,
             },
         );
         shared.apply_call("phone-a", CallState::Ringing, "", "Ada");
@@ -2779,5 +2847,97 @@ mod tests {
             shared.note_received_photo("phone-b", "keep.jpg").as_deref(),
             Some("p2")
         );
+    }
+
+    #[test]
+    fn phone_status_includes_dnd_and_only_that_phone_suppresses_popups() {
+        let mut quiet = phone_view("quiet", "Quiet", true);
+        quiet.dnd = true;
+        let loud = phone_view("loud", "Loud", true);
+        let json = serde_json::to_value(&quiet).unwrap();
+        assert_eq!(json["id"], "quiet");
+        assert_eq!(json["name"], "Quiet");
+        assert_eq!(json["dnd"], true);
+        assert_eq!(json["connected"], true);
+
+        let link = link_with(vec![quiet, loud]);
+        {
+            let shared = link.shared.lock().unwrap();
+            assert!(shared.phone_dnd("quiet"));
+            assert!(!shared.phone_dnd("loud"));
+            assert!(!shared.phone_dnd("missing"));
+            let silenced = seam_core::link::present_notification(shared.phone_dnd("quiet"));
+            assert!(
+                !silenced.popup,
+                "Do Not Disturb suppresses this phone's system popup"
+            );
+            assert!(silenced.list, "the window still lists the notification");
+            assert!(seam_core::link::suppress_notification_popup(
+                shared.phone_dnd("quiet")
+            ));
+            let normal = seam_core::link::present_notification(shared.phone_dnd("loud"));
+            assert!(normal.popup);
+            assert!(normal.list);
+            assert!(!seam_core::link::suppress_notification_popup(
+                shared.phone_dnd("loud")
+            ));
+        }
+        let status = serde_json::to_value(link.status()).unwrap();
+        let phones = status["phones"].as_array().unwrap();
+        // Sorted by name: Loud, then Quiet.
+        assert_eq!(phones[0]["name"], "Loud");
+        assert_eq!(phones[0]["dnd"], false);
+        assert_eq!(phones[1]["name"], "Quiet");
+        assert_eq!(phones[1]["dnd"], true);
+    }
+
+    #[test]
+    fn set_dnd_state_does_not_clear_a_known_phone_and_set_dnd_needs_a_connection() {
+        let mut shared = Shared::default();
+        shared.phones.insert(
+            "phone-a".into(),
+            PhoneView {
+                id: "phone-a".into(),
+                name: "Pixel".into(),
+                connected: true,
+                battery: Some((40, false)),
+                dnd: false,
+            },
+        );
+        shared.set_dnd_state("phone-a", true);
+        let phone = shared.phones.get("phone-a").unwrap();
+        assert!(phone.dnd);
+        assert!(phone.connected);
+        assert_eq!(phone.name, "Pixel");
+        assert_eq!(phone.battery, Some((40, false)));
+        shared.set_dnd_state("phone-b", true);
+        assert!(shared.phone_dnd("phone-b"));
+        assert!(!shared.phones.get("phone-b").unwrap().connected);
+
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            offline.set_dnd("phone-a", true).unwrap_err(),
+            "the phone link is not running"
+        );
+
+        let dir = std::env::temp_dir().join(format!("seam-dnd-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Test Desktop".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            link.set_dnd("phone-a", false).unwrap_err(),
+            "this phone is not connected"
+        );
+        assert_eq!(
+            Message::DndSet { on: true }.to_line(),
+            r#"{"type":"dnd_set","on":true}"#,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

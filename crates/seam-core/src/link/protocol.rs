@@ -198,6 +198,14 @@ pub enum Message {
     OpenUrl {
         url: String,
     },
+    /// Phone → desktop: Do Not Disturb is on or off. Sent on connect and when it changes.
+    Dnd {
+        on: bool,
+    },
+    /// Desktop → phone: turn the phone's Do Not Disturb on or off.
+    DndSet {
+        on: bool,
+    },
     Ping,
     Pong,
     /// Any message type this build doesn't know. Ignored, so newer phones still work.
@@ -873,5 +881,26 @@ mod tests {
                 url: "http://example.com".into(),
             }
         );
+    }
+
+    #[test]
+    fn dnd_and_dnd_set_round_trip() {
+        let on = Message::Dnd { on: true };
+        assert_eq!(on.to_line(), r#"{"type":"dnd","on":true}"#);
+        assert_eq!(Message::from_line(&on.to_line()).unwrap(), on);
+        assert_eq!(
+            Message::from_line(r#"{"type":"dnd","on":false}"#).unwrap(),
+            Message::Dnd { on: false }
+        );
+
+        let set_off = Message::DndSet { on: false };
+        assert_eq!(set_off.to_line(), r#"{"type":"dnd_set","on":false}"#);
+        assert_eq!(Message::from_line(&set_off.to_line()).unwrap(), set_off);
+        assert_eq!(
+            Message::from_line(r#"{"type":"dnd_set","on":true}"#).unwrap(),
+            Message::DndSet { on: true }
+        );
+        assert!(Message::from_line(r#"{"type":"dnd"}"#).is_err());
+        assert!(Message::from_line(r#"{"type":"dnd_set"}"#).is_err());
     }
 }

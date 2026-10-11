@@ -5,6 +5,7 @@
 //! Protocol: `protocol/PROTOCOL.md`.
 
 pub mod client;
+pub mod dnd;
 pub mod mdns;
 pub mod open_url;
 pub mod photos;
@@ -13,6 +14,7 @@ pub mod server;
 pub mod store;
 pub mod transfer;
 
+pub use dnd::{present_notification, suppress_notification_popup};
 pub use open_url::{
     notification_title, on_incoming_link, url_to_open, validate_open_url, IncomingLink, ValidUrl,
     MAX_URL_CHARS,

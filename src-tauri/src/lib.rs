@@ -107,6 +107,11 @@ fn dismiss_notification(phone_link: State<link::Link>, phone: String, id: String
 }
 
 #[tauri::command]
+fn set_dnd(phone_link: State<link::Link>, phone: String, on: bool) -> Result<(), String> {
+    phone_link.set_dnd(&phone, on)
+}
+
+#[tauri::command]
 fn reply_notification(
     phone_link: State<link::Link>,
     phone: String,
@@ -278,6 +283,7 @@ pub fn run() {
             start_pairing,
             forget_phone,
             dismiss_notification,
+            set_dnd,
             reply_notification,
             call_action,
             ring_phone,
@@ -328,5 +334,13 @@ mod capability_tests {
         assert!(perm.contains("pending_links"));
         assert!(perm.contains("send_open_url"));
         assert!(perm.contains("open_link"));
+    }
+
+    #[test]
+    fn dnd_command_is_allowed_for_the_window() {
+        let caps = include_str!("../capabilities/default.json");
+        let perm = include_str!("../permissions/app.toml");
+        assert!(caps.contains("seam-commands"));
+        assert!(perm.contains("set_dnd"), "seam-commands must allow set_dnd");
     }
 }

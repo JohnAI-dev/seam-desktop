@@ -766,6 +766,58 @@ async fn phone_receives_ring_then_ring_stop() {
     );
 }
 
+#[tokio::test]
+async fn phone_reports_dnd_and_receives_dnd_set() {
+    let (server, mut events, port) = start("dnd").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    phone.send(&Message::Dnd { on: true }).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Dnd {
+            device_id: "phone-1".into(),
+            on: true,
+        }
+    );
+
+    // DND does not drop the notification; the desktop decides whether to pop it up.
+    let n = PhoneNotification {
+        id: "while-dnd".into(),
+        app: "com.example".into(),
+        app_name: "Example".into(),
+        title: "Quiet".into(),
+        text: "still delivered".into(),
+        time: 5,
+        replyable: false,
+    };
+    phone.send(&Message::Notification(n.clone())).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Notification {
+            device_id: "phone-1".into(),
+            notification: n,
+        }
+    );
+
+    assert!(server.send_to("phone-1", Message::DndSet { on: false }));
+    let got = next_msg(&mut phone).await;
+    assert_eq!(got.to_line(), r#"{"type":"dnd_set","on":false}"#);
+    assert_eq!(got, Message::DndSet { on: false });
+
+    phone.send(&Message::Dnd { on: false }).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Dnd {
+            device_id: "phone-1".into(),
+            on: false,
+        }
+    );
+}
+
 struct SendOutcome {
     ok: bool,
     error: Option<String>,

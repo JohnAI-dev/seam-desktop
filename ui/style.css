@@ -44,6 +44,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 .section-head h2 { margin-bottom: 8px; }
 button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
 button.ring-stop { color: var(--warn); border-color: var(--warn); }
+button.dnd-on { color: var(--warn); border-color: var(--warn); }
 button.link { background: transparent; color: var(--muted); padding: 4px 8px; font-weight: 500; }
 .pairing {
   background: var(--card); border: 1px solid var(--line); border-radius: 12px;
