@@ -2,6 +2,7 @@
 //! sends are streamed into the download folder. Files sent to a phone are read
 //! from disk and written one chunk at a time so the connection stays responsive.
 
+use super::open_url::{self, IncomingLink};
 use super::protocol::{self, Message, PairingInfo, PhoneNotification, MAX_FRAME};
 use super::store::{PairedDevice, Store};
 use super::transfer;
@@ -14,7 +15,7 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -38,6 +39,8 @@ const FILE_ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 const FILE_RESULT_TIMEOUT: Duration = Duration::from_secs(180);
 /// One queued file frame, so a send cannot fill memory or hold the writer.
 const FILE_QUEUE: usize = 1;
+/// Recent `open_url` requests kept per server. Newest first.
+const MAX_INCOMING_LINKS: usize = 30;
 
 /// Something that happened on the link, for the app to show.
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +152,23 @@ struct Inner {
     download_dir: PathBuf,
     /// Connections that have not completed the handshake.
     unauth: Mutex<usize>,
+    /// http(s) links a phone asked us to open. Newest first. Never opened here.
+    open_urls: Mutex<Vec<IncomingLink>>,
+}
+
+/// Servers still alive, so the window can list links without the UI state type.
+static LIVE_SERVERS: Mutex<Vec<Weak<Inner>>> = Mutex::new(Vec::new());
+
+fn register_live(inner: &Arc<Inner>) {
+    let mut live = LIVE_SERVERS.lock().unwrap();
+    live.retain(|weak| weak.strong_count() > 0);
+    live.push(Arc::downgrade(inner));
+}
+
+fn live_inners() -> Vec<Arc<Inner>> {
+    let mut live = LIVE_SERVERS.lock().unwrap();
+    live.retain(|weak| weak.strong_count() > 0);
+    live.iter().filter_map(Weak::upgrade).collect()
 }
 
 /// The link server. Cheap to clone; all clones share state.
@@ -191,13 +211,11 @@ impl LinkServer {
             outbound: Mutex::new(HashMap::new()),
             download_dir,
             unauth: Mutex::new(0),
+            open_urls: Mutex::new(Vec::new()),
         };
-        Ok((
-            Self {
-                inner: Arc::new(inner),
-            },
-            rx,
-        ))
+        let inner = Arc::new(inner);
+        register_live(&inner);
+        Ok((Self { inner }, rx))
     }
 
     /// SHA-256 fingerprint of this desktop's certificate.
@@ -226,6 +244,21 @@ impl LinkServer {
             .unwrap()
             .get(device_id)
             .is_some_and(|tx| tx.send(msg).is_ok())
+    }
+
+    /// Validated `open_url` to a connected phone. Does not open anything locally.
+    pub fn send_open_url(&self, phone_id: &str, url: &str) -> Result<(), String> {
+        let valid = open_url::validate_open_url(url).map_err(|e| e.to_string())?;
+        if self.send_to(phone_id, Message::OpenUrl { url: valid.url }) {
+            Ok(())
+        } else {
+            Err("this phone is not connected".into())
+        }
+    }
+
+    /// Links a phone asked this computer to open, newest first.
+    pub fn incoming_links(&self) -> Vec<IncomingLink> {
+        self.inner.open_urls.lock().unwrap().clone()
     }
 
     /// Start sending the file at `path` to a connected phone.
@@ -609,6 +642,41 @@ impl LinkServer {
         });
     }
 
+    /// Record a phone's `open_url` if it is http(s). Invalid URLs are ignored.
+    ///
+    /// This never opens a browser. The window shows a notification and a Links row;
+    /// the URL is opened only after the person clicks one of those.
+    fn note_open_url(&self, device_id: &str, url: &str) {
+        let Ok(valid) = open_url::validate_open_url(url) else {
+            return;
+        };
+        let stored = self
+            .inner
+            .store
+            .device(device_id)
+            .map(|device| device.name)
+            .unwrap_or_default();
+        let trimmed = stored.trim();
+        let phone_name = if trimmed.is_empty() {
+            "phone".to_string()
+        } else {
+            trimmed.to_string()
+        };
+        let link = IncomingLink {
+            id: new_transfer_id(),
+            phone: device_id.to_string(),
+            phone_name,
+            url: valid.url,
+            host: valid.host,
+        };
+        {
+            let mut links = self.inner.open_urls.lock().unwrap();
+            links.insert(0, link.clone());
+            links.truncate(MAX_INCOMING_LINKS);
+        }
+        open_url::emit_incoming(link);
+    }
+
     /// Handle one inbound file frame. Other messages are returned so the session can emit them.
     async fn handle_file<W: tokio::io::AsyncWrite + Unpin>(
         &self,
@@ -825,6 +893,10 @@ impl LinkServer {
                                 taken,
                                 thumb,
                             })
+                        }
+                        Message::OpenUrl { url } => {
+                            self.note_open_url(device_id, &url);
+                            None
                         }
                         Message::Pong => { missed_pongs = 0; None }
                         Message::Ping => { send(writer, &Message::Pong).await?; None }
@@ -1264,6 +1336,48 @@ pub fn local_ip() -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Every stored incoming link, newest first within each server.
+pub fn all_incoming_links() -> Vec<IncomingLink> {
+    let mut out = Vec::new();
+    for inner in live_inners() {
+        out.extend(inner.open_urls.lock().unwrap().iter().cloned());
+    }
+    out
+}
+
+/// The stored link `id`, re-checked as http(s). Unknown ids are an error.
+pub fn lookup_incoming_link(id: &str) -> Result<IncomingLink, String> {
+    if id.is_empty() {
+        return Err("unknown link".into());
+    }
+    for inner in live_inners() {
+        let links = inner.open_urls.lock().unwrap();
+        if let Some(link) = links.iter().find(|link| link.id == id) {
+            open_url::validate_open_url(&link.url).map_err(|e| e.to_string())?;
+            return Ok(link.clone());
+        }
+    }
+    Err("unknown link".into())
+}
+
+/// Send a validated `open_url` to a connected phone on any live server.
+pub fn dispatch_open_url(phone_id: &str, url: &str) -> Result<(), String> {
+    let valid = open_url::validate_open_url(url).map_err(|e| e.to_string())?;
+    let msg = Message::OpenUrl { url: valid.url };
+    for inner in live_inners() {
+        let sent = inner
+            .outboxes
+            .lock()
+            .unwrap()
+            .get(phone_id)
+            .is_some_and(|tx| tx.send(msg.clone()).is_ok());
+        if sent {
+            return Ok(());
+        }
+    }
+    Err("this phone is not connected".into())
 }
 
 #[cfg(test)]

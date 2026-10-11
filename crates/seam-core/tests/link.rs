@@ -1022,3 +1022,187 @@ async fn desktop_sends_a_file_and_a_reject_ends_cleanly() {
     );
     let _ = std::fs::remove_dir_all(&file_dir);
 }
+
+#[tokio::test]
+async fn open_url_both_ways_waits_for_a_click() {
+    let (server, mut events, port) = start("open-url").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-links", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    phone
+        .send(&Message::Battery {
+            level: 1,
+            charging: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-links".into(),
+            level: 1,
+            charging: false,
+        }
+    );
+
+    // Dangerous and unusable URLs are ignored. Nothing is opened.
+    for url in [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "data:text/html,hi",
+        "http://",
+        "https://",
+        "http:///etc/passwd",
+    ] {
+        phone
+            .send(&Message::OpenUrl { url: url.into() })
+            .await
+            .unwrap();
+    }
+    let too_long = format!("https://example.com/{}", "z".repeat(5000));
+    phone
+        .send(&Message::OpenUrl { url: too_long })
+        .await
+        .unwrap();
+    phone
+        .send(&Message::Battery {
+            level: 2,
+            charging: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-links".into(),
+            level: 2,
+            charging: false,
+        }
+    );
+    assert!(server.incoming_links().is_empty());
+
+    phone
+        .send(&Message::OpenUrl {
+            url: "https://example.com/a?b=1".into(),
+        })
+        .await
+        .unwrap();
+    phone
+        .send(&Message::Battery {
+            level: 3,
+            charging: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-links".into(),
+            level: 3,
+            charging: true,
+        }
+    );
+    let links = server.incoming_links();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].phone, "phone-links");
+    assert_eq!(links[0].phone_name, "Pixel");
+    assert_eq!(links[0].host, "example.com");
+    assert_eq!(links[0].url, "https://example.com/a?b=1");
+    assert_eq!(
+        seam_core::link::notification_title(&links[0].phone_name),
+        "Open link from Pixel?"
+    );
+    assert!(seam_core::link::url_to_open(&links[0].url)
+        .unwrap()
+        .starts_with("https://"));
+    assert_eq!(
+        seam_core::link::lookup_incoming_link(&links[0].id)
+            .unwrap()
+            .url,
+        links[0].url
+    );
+    assert!(seam_core::link::lookup_incoming_link("").is_err());
+    assert!(seam_core::link::lookup_incoming_link("missing").is_err());
+    assert!(seam_core::link::all_incoming_links()
+        .iter()
+        .any(|link| link.id == links[0].id));
+
+    // Desktop → phone. The fake phone receives the frame; it does not open it.
+    server
+        .send_open_url("phone-links", "https://example.com/docs")
+        .unwrap();
+    let got = next_msg(&mut phone).await;
+    assert_eq!(
+        got.to_line(),
+        r#"{"type":"open_url","url":"https://example.com/docs"}"#,
+    );
+    assert_eq!(
+        got,
+        Message::OpenUrl {
+            url: "https://example.com/docs".into(),
+        }
+    );
+
+    assert_eq!(
+        server
+            .send_open_url("phone-links", "javascript:alert(1)")
+            .unwrap_err(),
+        "not an http(s) url"
+    );
+    assert_eq!(
+        server
+            .send_open_url("phone-links", "file:///etc/passwd")
+            .unwrap_err(),
+        "not an http(s) url"
+    );
+    assert_eq!(
+        server
+            .send_open_url("phone-links", "data:text/html,hi")
+            .unwrap_err(),
+        "not an http(s) url"
+    );
+    assert_eq!(
+        server.send_open_url("phone-links", "http://").unwrap_err(),
+        "missing host"
+    );
+    assert_eq!(
+        server
+            .send_open_url(
+                "phone-links",
+                &format!("https://example.com/{}", "q".repeat(5000)),
+            )
+            .unwrap_err(),
+        "url is too long"
+    );
+    assert_eq!(
+        server
+            .send_open_url("nobody", "https://example.com")
+            .unwrap_err(),
+        "this phone is not connected"
+    );
+    // None of those were written to the phone.
+    assert!(server.send_to(
+        "phone-links",
+        Message::Dismiss {
+            id: "after-bad-url".into(),
+        },
+    ));
+    assert_eq!(
+        next_msg(&mut phone).await,
+        Message::Dismiss {
+            id: "after-bad-url".into(),
+        }
+    );
+
+    seam_core::link::dispatch_open_url("phone-links", "http://docs.example/guide").unwrap();
+    assert_eq!(
+        next_msg(&mut phone).await,
+        Message::OpenUrl {
+            url: "http://docs.example/guide".into(),
+        }
+    );
+    assert!(seam_core::link::dispatch_open_url("phone-links", "javascript:alert(1)").is_err());
+}

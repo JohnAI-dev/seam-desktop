@@ -1,6 +1,7 @@
 //! Seam desktop app: the window, and the commands its UI calls.
 
 mod link;
+mod open_url;
 mod updates;
 mod wireless;
 
@@ -261,6 +262,7 @@ pub fn run() {
         .manage(SelfTest(self_test))
         .setup(move |app| {
             use_bundled_tools(app.handle());
+            open_url::install(app.handle());
             app.manage(link::start(app.handle(), !self_test));
             link::watch_drops(app.handle());
             app.manage(wireless::start(app.handle()));
@@ -291,6 +293,9 @@ pub fn run() {
             start_wireless_pairing,
             cancel_wireless_pairing,
             request_photo,
+            open_url::pending_links,
+            open_url::send_open_url,
+            open_url::open_link,
             frontend_ready
         ])
         .run(tauri::generate_context!())
@@ -313,5 +318,15 @@ mod capability_tests {
         );
         assert!(perm.contains("frontend_ready"));
         assert!(perm.contains("link_status"));
+    }
+
+    #[test]
+    fn open_link_commands_are_allowed_for_the_window() {
+        let caps = include_str!("../capabilities/default.json");
+        let perm = include_str!("../permissions/app.toml");
+        assert!(caps.contains("seam-commands"));
+        assert!(perm.contains("pending_links"));
+        assert!(perm.contains("send_open_url"));
+        assert!(perm.contains("open_link"));
     }
 }

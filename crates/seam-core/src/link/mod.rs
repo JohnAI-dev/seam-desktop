@@ -6,14 +6,21 @@
 
 pub mod client;
 pub mod mdns;
+pub mod open_url;
 pub mod photos;
 pub mod protocol;
 pub mod server;
 pub mod store;
 pub mod transfer;
 
+pub use open_url::{
+    notification_title, on_incoming_link, url_to_open, validate_open_url, IncomingLink, ValidUrl,
+    MAX_URL_CHARS,
+};
 pub use protocol::{Message, PairingInfo, PhoneNotification};
-pub use server::{local_ip, LinkEvent, LinkServer};
+pub use server::{
+    all_incoming_links, dispatch_open_url, local_ip, lookup_incoming_link, LinkEvent, LinkServer,
+};
 pub use store::PairedDevice;
 
 /// The pairing link as an SVG QR code.

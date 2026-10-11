@@ -193,6 +193,11 @@ pub enum Message {
     PhotoRequest {
         id: String,
     },
+    /// Either direction: ask the other side to open this http(s) URL.
+    /// The receiver must not open it until the person confirms.
+    OpenUrl {
+        url: String,
+    },
     Ping,
     Pong,
     /// Any message type this build doesn't know. Ignored, so newer phones still work.
@@ -848,6 +853,24 @@ mod tests {
                 transfer: id.into(),
                 ok: false,
                 error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn open_url_round_trip() {
+        let msg = Message::OpenUrl {
+            url: "https://example.com/a".into(),
+        };
+        assert_eq!(
+            msg.to_line(),
+            r#"{"type":"open_url","url":"https://example.com/a"}"#,
+        );
+        assert_eq!(Message::from_line(&msg.to_line()).unwrap(), msg);
+        assert_eq!(
+            Message::from_line(r#"{"type":"open_url","url":"http://example.com"}"#).unwrap(),
+            Message::OpenUrl {
+                url: "http://example.com".into(),
             }
         );
     }
