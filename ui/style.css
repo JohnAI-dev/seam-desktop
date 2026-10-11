@@ -116,3 +116,17 @@ button.link { background: transparent; color: var(--muted); padding: 4px 8px; fo
 .drop-ask-phones { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 .steps { margin: 0 0 12px; padding-left: 1.2em; }
 .steps li { margin: 4px 0; }
+.device > .send-link, .send-link-wrap { flex: 1 1 100%; }
+.send-link { display: flex; gap: 8px; align-items: center; }
+.send-link input {
+  flex: 1; min-width: 0; font: inherit; padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg);
+}
+.send-link-error { margin: 4px 0 0; color: var(--bad); font-size: 13px; }
+.link-row {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px; margin-bottom: 6px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+}
+.link-row .info { flex: 1; min-width: 0; }
+.link-row .name { font-weight: 600; overflow-wrap: anywhere; }
+.link-row .meta { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }

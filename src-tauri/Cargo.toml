@@ -23,4 +23,6 @@ serde = { version = "1", features = ["derive"] }
 # Needed by the code tauri generates for plugin configuration.
 serde_json = "1"
 arboard = "3"
+notify-rust = { version = "=4.11.0", default-features = false, features = ["zbus"] }
+open = "=5.3.1"
 

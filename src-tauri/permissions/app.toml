@@ -25,5 +25,8 @@ commands.allow = [
   "start_wireless_pairing",
   "cancel_wireless_pairing",
   "request_photo",
+  "pending_links",
+  "send_open_url",
+  "open_link",
   "frontend_ready",
 ]

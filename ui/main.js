@@ -594,9 +594,223 @@ function pruneRinging(link) {
   }
 }
 
+const linkDrafts = new Map();
+
+function sendLinkState(phoneId) {
+  let state = linkDrafts.get(phoneId);
+  if (!state) {
+    state = { text: "", error: "", sending: false };
+    linkDrafts.set(phoneId, state);
+  }
+  return state;
+}
+
+function pruneLinkDrafts(link) {
+  const ids = new Set((link.phones || []).map((p) => p.id));
+  for (const id of [...linkDrafts.keys()]) {
+    if (!ids.has(id)) linkDrafts.delete(id);
+  }
+}
+
+function openUrlError(raw) {
+  const url = String(raw || "").trim();
+  if (!url) return "not an http(s) url";
+  if ([...url].length > 4096) return "url is too long";
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    return /^https?:\/\//i.test(url) ? "missing host" : "not an http(s) url";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "not an http(s) url";
+  if (!parsed.hostname) return "missing host";
+  return "";
+}
+
+function captureSendLinkFocus() {
+  const active = document.activeElement;
+  if (!active || !active.classList || !active.classList.contains("send-link-text")) return null;
+  return {
+    phone: active.dataset.phone || "",
+    start: active.selectionStart,
+    end: active.selectionEnd,
+  };
+}
+
+function findSendLinkInput(phone) {
+  for (const input of document.querySelectorAll("input.send-link-text")) {
+    if (input.dataset.phone === phone) return input;
+  }
+  return null;
+}
+
+function restoreSendLinkFocus(saved) {
+  if (!saved) return;
+  const input = findSendLinkInput(saved.phone);
+  if (!input) return;
+  input.focus();
+  if (typeof saved.start === "number") {
+    try {
+      input.setSelectionRange(saved.start, saved.end);
+    } catch (e) {
+      /* the input may not accept a selection */
+    }
+  }
+}
+
+async function submitSendLink(phoneId, phoneName) {
+  const state = sendLinkState(phoneId);
+  if (state.sending) return;
+  const input = findSendLinkInput(phoneId);
+  if (input) state.text = input.value;
+  const text = state.text.trim();
+  const problem = openUrlError(text);
+  if (problem) {
+    state.error = problem;
+    if (lastLink) renderLink(lastLink);
+    const again = findSendLinkInput(phoneId);
+    if (again) again.focus();
+    return;
+  }
+  state.error = "";
+  state.sending = true;
+  if (lastLink) renderLink(lastLink);
+  try {
+    await invoke("send_open_url", { phone: phoneId, url: text });
+    const cur = sendLinkState(phoneId);
+    cur.text = "";
+    cur.error = "";
+    cur.sending = false;
+    showLinkError(null);
+    showLinkConfirm("Link sent to " + (phoneName || "phone") + ".");
+    if (lastLink) renderLink(lastLink);
+  } catch (e) {
+    const cur = sendLinkState(phoneId);
+    cur.sending = false;
+    cur.error = String(e);
+    if (lastLink) renderLink(lastLink);
+    const again = findSendLinkInput(phoneId);
+    if (again) again.focus();
+  }
+}
+
+function sendLinkControls(phone) {
+  const state = sendLinkState(phone.id);
+  const input = el("input", {
+    type: "url",
+    className: "send-link-text",
+    value: state.text,
+    placeholder: "https://example.com",
+  });
+  input.dataset.phone = phone.id;
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.setAttribute("aria-label", "Send link to phone");
+  input.readOnly = !!state.sending;
+  input.addEventListener("input", () => {
+    const cur = sendLinkState(phone.id);
+    cur.text = input.value;
+    if (cur.error) cur.error = "";
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitSendLink(phone.id, phone.name);
+    }
+  });
+  const btn = el("button", {
+    type: "button",
+    className: "secondary",
+    textContent: state.sending ? "Sending\u2026" : "Send link to phone",
+    disabled: !!state.sending,
+  });
+  btn.addEventListener("click", () => submitSendLink(phone.id, phone.name));
+  const field = el("div", { className: "send-link" }, input, btn);
+  if (!state.error) return field;
+  return el(
+    "div",
+    { className: "send-link-wrap" },
+    field,
+    el("p", { className: "send-link-error", textContent: state.error }),
+  );
+}
+
+function renderOpenLinks(links) {
+  const section = document.getElementById("links-section");
+  const list = document.getElementById("links");
+  if (!section || !list) return;
+  const rows = (links || []).filter((link) => link && link.id);
+  if (!rows.length) {
+    section.hidden = true;
+    list.replaceChildren();
+    return;
+  }
+  section.hidden = false;
+  list.replaceChildren(
+    ...rows.map((link) => {
+      const open = el("button", { type: "button", className: "secondary", textContent: "Open" });
+      const activate = async () => {
+        if (open.dataset.busy === "1") return;
+        open.dataset.busy = "1";
+        open.disabled = true;
+        try {
+          await invoke("open_link", { id: link.id });
+          showLinkError(null);
+        } catch (e) {
+          showLinkError(String(e));
+        } finally {
+          open.dataset.busy = "0";
+          open.disabled = false;
+        }
+      };
+      open.addEventListener("click", (e) => {
+        e.stopPropagation();
+        activate();
+      });
+      const from = link.phone_name ? "from " + link.phone_name : "";
+      const meta = from ? from + " \u00b7 " + (link.url || "") : (link.url || "");
+      const row = el(
+        "li",
+        { className: "link-row" },
+        el(
+          "div",
+          { className: "info" },
+          el("div", { className: "name", textContent: link.host || link.url || "Link" }),
+          meta ? el("div", { className: "meta", textContent: meta }) : "",
+        ),
+        open,
+      );
+      row.addEventListener("click", () => activate());
+      return row;
+    }),
+  );
+}
+
+async function refreshOpenLinks() {
+  try {
+    const links = await invoke("pending_links");
+    renderOpenLinks(links);
+  } catch (e) {
+    // Don't fail the window if the list cannot be read yet.
+  }
+}
+
+function listenForOpenUrls() {
+  try {
+    const listen = window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+    if (typeof listen !== "function") return;
+    listen("open-url", () => {
+      refreshOpenLinks();
+    }).catch(() => {});
+  } catch (e) {
+    // Polling still updates the list.
+  }
+}
+
 function renderLink(link) {
   lastLink = link;
   pruneRinging(link);
+  pruneLinkDrafts(link);
   renderCall(link.call);
   const liveNotes = new Set(link.notifications.map((n) => noteKey(n.phone, n.id)));
   for (const [key, state] of composers) {
@@ -605,6 +819,7 @@ function renderLink(link) {
       composers.delete(key);
     }
   }
+  const focusedSendLink = captureSendLinkFocus();
   const list = document.getElementById("linked");
   list.replaceChildren(
     ...link.phones.map((p) => {
@@ -673,14 +888,14 @@ function renderLink(link) {
         buttons.push(sendFile, ring, send);
       }
       buttons.push(forget);
-      return el(
-        "li",
-        { className: "device" },
+      const row = [
         el("div", { className: "info" },
           el("div", { className: "name" }, el("span", { className: `dot${p.connected ? " on" : ""}` }), p.name),
           el("div", { className: "meta", textContent: meta })),
         ...buttons,
-      );
+      ];
+      if (p.connected) row.push(sendLinkControls(p));
+      return el("li", { className: "device" }, ...row);
     }),
   );
   document.getElementById("linked-empty").hidden = link.phones.length > 0;
@@ -732,6 +947,7 @@ function renderLink(link) {
     }),
   );
   restoreReplyFocus(focusedReply);
+  restoreSendLinkFocus(focusedSendLink);
   document.getElementById("notif-empty").hidden = link.notifications.length > 0;
   renderFiles(link);
   showLinkError(link.error);
@@ -914,6 +1130,7 @@ async function refreshLink() {
 
 async function refresh() {
   refreshLink().catch((e) => showLinkError(String(e)));
+  refreshOpenLinks().catch(() => {});
   await refreshWireless().catch((e) => showWirelessError(String(e)));
   const status = await invoke("status");
   renderDevices(status);
@@ -968,6 +1185,7 @@ async function waitForLink() {
     listenForIncomingCalls();
     listenForFileTransfers();
     listenForWireless();
+    listenForOpenUrls();
     const status = await refresh();
     const link = await waitForLink();
     const rendered = document.querySelectorAll("#tools li").length === 2 && !!document.getElementById("pair-btn");
