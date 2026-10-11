@@ -216,6 +216,18 @@ function listenForIncomingCalls() {
   }
 }
 
+function listenForDnd() {
+  try {
+    const listen = window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+    if (typeof listen !== "function") return;
+    listen("dnd", () => {
+      refreshLink().catch((e) => showLinkError(String(e)));
+    }).catch(() => {});
+  } catch (e) {
+    // Polling still updates the Do Not Disturb label.
+  }
+}
+
 function phoneLabel(link, id) {
   const phones = link.phones || [];
   for (let i = 0; i < phones.length; i++) {
@@ -825,6 +837,7 @@ function renderLink(link) {
     ...link.phones.map((p) => {
       let meta = p.connected ? "Connected over Wi-Fi" : "Not connected";
       if (p.connected && p.battery) meta += ` · ${p.battery[0]}%${p.battery[1] ? " ⚡" : ""}`;
+      meta += p.dnd ? " · Do Not Disturb on" : " · Do Not Disturb off";
       const forget = el("button", { className: "link", textContent: "Forget" });
       forget.addEventListener("click", async () => {
         if (!confirm(`Forget ${p.name}? You'll need to pair it again.`)) return;
@@ -887,6 +900,27 @@ function renderLink(link) {
         });
         buttons.push(sendFile, ring, send);
       }
+      const silence = el("button", {
+        type: "button",
+        className: p.dnd ? "secondary dnd-on" : "secondary",
+        textContent: "Silence phone",
+        title: p.dnd ? "Do Not Disturb is on" : "Turn on Do Not Disturb",
+      });
+      silence.setAttribute("aria-pressed", p.dnd ? "true" : "false");
+      silence.disabled = !p.connected;
+      silence.addEventListener("click", async () => {
+        silence.disabled = true;
+        try {
+          await invoke("set_dnd", { phone: p.id, on: !p.dnd });
+          showLinkError(null);
+          await refreshLink();
+        } catch (e) {
+          showLinkError(String(e));
+        } finally {
+          silence.disabled = !p.connected;
+        }
+      });
+      buttons.push(silence);
       buttons.push(forget);
       const row = [
         el("div", { className: "info" },
@@ -1183,6 +1217,7 @@ async function waitForLink() {
   try {
     listenForReplyResults();
     listenForIncomingCalls();
+    listenForDnd();
     listenForFileTransfers();
     listenForWireless();
     listenForOpenUrls();

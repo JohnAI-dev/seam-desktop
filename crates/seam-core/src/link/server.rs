@@ -69,6 +69,11 @@ pub enum LinkEvent {
         level: u8,
         charging: bool,
     },
+    /// Phone reported Do Not Disturb. `on` is that phone's current state.
+    Dnd {
+        device_id: String,
+        on: bool,
+    },
     Clipboard {
         device_id: String,
         text: String,
@@ -894,6 +899,10 @@ impl LinkServer {
                                 thumb,
                             })
                         }
+                        Message::Dnd { on } => Some(LinkEvent::Dnd {
+                            device_id: id,
+                            on,
+                        }),
                         Message::OpenUrl { url } => {
                             self.note_open_url(device_id, &url);
                             None
