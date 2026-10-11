@@ -181,6 +181,12 @@ async fn reveal_file(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|_| "could not show the file".to_string())?
 }
 
+/// Ask a connected phone to send a recent photo. The file arrives as a normal transfer.
+#[tauri::command]
+fn request_photo(phone_link: State<link::Link>, phone: String, id: String) -> Result<(), String> {
+    phone_link.request_photo(&phone, &id)
+}
+
 /// Send dropped files to the only connected phone, or ask the window which one.
 #[tauri::command]
 async fn handle_file_drop(app: AppHandle, paths: Vec<String>) -> Result<link::DropPlan, String> {
@@ -284,8 +290,28 @@ pub fn run() {
             wireless_status,
             start_wireless_pairing,
             cancel_wireless_pairing,
+            request_photo,
             frontend_ready
         ])
         .run(tauri::generate_context!())
         .expect("error while running Seam");
+}
+
+#[cfg(test)]
+mod capability_tests {
+    #[test]
+    fn photo_request_is_allowed_for_the_window() {
+        let caps = include_str!("../capabilities/default.json");
+        let perm = include_str!("../permissions/app.toml");
+        assert!(
+            caps.contains("seam-commands"),
+            "the window capability must grant seam-commands or request_photo is denied"
+        );
+        assert!(
+            perm.contains("request_photo"),
+            "seam-commands must allow request_photo"
+        );
+        assert!(perm.contains("frontend_ready"));
+        assert!(perm.contains("link_status"));
+    }
 }

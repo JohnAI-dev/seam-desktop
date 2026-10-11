@@ -438,6 +438,11 @@ impl Inbound {
         self.transfer == transfer
     }
 
+    /// Offered file name after path stripping, before a duplicate suffix.
+    pub(crate) fn offered_name(&self) -> &str {
+        &self.name
+    }
+
     /// Write the next chunk. A rejected chunk is not written and does not advance state.
     pub(crate) fn push_chunk(
         &mut self,
@@ -460,12 +465,14 @@ impl Inbound {
     }
 
     /// Check size and SHA-256, then move the temp file into `dir`. On error the partial is deleted.
+    ///
+    /// The returned name is the offered file name after sanitizing, before a duplicate suffix.
     pub(crate) fn finish(
         mut self,
         dir: &Path,
         transfer: &str,
         sha256: &str,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<(PathBuf, String), String> {
         if self.transfer != transfer {
             return Err("wrong transfer".into());
         }
@@ -488,7 +495,7 @@ impl Inbound {
         fs::rename(&self.temp, &dest).map_err(|e| format!("could not save the file: {e}"))?;
         self.committed = true;
         mark_downloaded(&dest);
-        Ok(dest)
+        Ok((dest, self.name.clone()))
     }
 }
 
@@ -919,7 +926,8 @@ mod tests {
         inbound
             .push_chunk(&id, 0, &STANDARD.encode(b"hello"))
             .unwrap();
-        let path = inbound.finish(&dir, &id, &sha256_hex(b"hello")).unwrap();
+        let (path, name) = inbound.finish(&dir, &id, &sha256_hex(b"hello")).unwrap();
+        assert_eq!(name, "passwd");
         assert_eq!(path, dir.join("passwd"));
         assert_eq!(std::fs::read(&path).unwrap(), b"hello");
         assert!(part_files(&dir).is_empty());
@@ -979,7 +987,8 @@ mod tests {
         let id = "aa".repeat(16);
         let inbound = Inbound::open(&dir, &id, ".hidden", 0).unwrap();
         assert_eq!(inbound.name, "hidden");
-        let path = inbound.finish(&dir, &id, &sha256_hex(b"")).unwrap();
+        let (path, name) = inbound.finish(&dir, &id, &sha256_hex(b"")).unwrap();
+        assert_eq!(name, "hidden");
         assert_eq!(path, dir.join("hidden"));
         assert_eq!(std::fs::read(&path).unwrap(), b"");
         assert!(part_files(&dir).is_empty());

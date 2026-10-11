@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Seam</title>
   <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="photos.css">
 </head>
 <body>
   <header>
@@ -44,6 +45,13 @@
       <p id="link-confirm" class="confirm" role="status" hidden></p>
       <p id="linked-empty" class="hint">No phone paired yet. Install the Seam app on your phone, then press <strong>Pair phone</strong>.</p>
       <p id="link-error" class="error" hidden></p>
+    </section>
+
+    <section id="photos-section" aria-labelledby="photos-h" hidden>
+      <h2 id="photos-h">Recent photos</h2>
+      <div id="photos" class="photo-strip" aria-live="polite"></div>
+      <p id="photos-status" class="hint" role="status" hidden></p>
+      <p class="hint">Click a photo to save it and show it in Finder or Explorer.</p>
     </section>
 
     <section aria-labelledby="notif-h">
@@ -105,5 +113,6 @@
   </main>
 
   <script src="main.js"></script>
+  <script src="photos.js"></script>
 </body>
 </html>

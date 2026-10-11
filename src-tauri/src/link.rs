@@ -1,7 +1,8 @@
 //! The phone link inside the app: runs the server, keeps what the window shows,
 //! and turns phone notifications and incoming calls into notifications on this computer.
 
-use seam_core::link::{self, LinkEvent, LinkServer, Message, PhoneNotification};
+use seam_core::link::transfer::sanitize_name;
+use seam_core::link::{self, photos, LinkEvent, LinkServer, Message, PhoneNotification};
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -78,6 +79,25 @@ pub struct CallView {
     caller: String,
 }
 
+/// One recent photo in the thumbnail strip.
+///
+/// `thumb` is a `data:image/jpeg;base64,...` URL, or empty when the phone sent
+/// none (or one that was too large to show). The window assigns it to `img.src`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PhotoView {
+    phone: String,
+    id: String,
+    name: String,
+    taken: i64,
+    thumb: String,
+    /// The full file has been saved this session.
+    saved: bool,
+    /// Times the full file arrived this session. A repeat click is done only when this grows.
+    saves: u32,
+    /// A `photo_request` is still waiting for the file.
+    pending: bool,
+}
+
 /// One outbound file, shown with progress, Cancel, and the result.
 #[derive(Debug, Clone, Serialize)]
 struct SendView {
@@ -141,6 +161,8 @@ pub struct LinkStatus {
     sends: Vec<SendView>,
     /// Files received from phones, newest first.
     received: Vec<ReceivedFileView>,
+    /// Recent photos, newest first, at most 12 per phone.
+    photos: Vec<PhotoView>,
 }
 
 #[derive(Serialize)]
@@ -148,6 +170,14 @@ pub struct PairingView {
     uri: String,
     qr_svg: String,
     expires_in_secs: u64,
+}
+
+/// A photo the window asked for, waiting on the normal file transfer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPhoto {
+    phone: String,
+    id: String,
+    name: String,
 }
 
 #[derive(Default)]
@@ -164,6 +194,13 @@ struct Shared {
     sends: VecDeque<SendView>,
     /// Files saved from phones, newest first.
     received: VecDeque<ReceivedFileView>,
+    /// Recent photos, newest first. At most 12 per phone, deduped by id.
+    photos: Vec<photos::RecentPhoto>,
+    /// Photo requests whose file has not arrived yet.
+    pending_photos: Vec<PendingPhoto>,
+    /// `(phone, id, saves)` of photos whose file was saved this session.
+    /// `saves` increases each time the file arrives, so a repeat click is not already done.
+    saved_photos: Vec<(String, String, u32)>,
     /// Last time a send-progress refresh was pushed to the window.
     last_transfer_emit: Option<Instant>,
 }
@@ -250,6 +287,19 @@ impl Shared {
         }
     }
 
+    /// Phone disconnected: hide its call and drop photo requests that never arrived.
+    ///
+    /// Returns whether a ringing banner was cleared. A leftover request must not
+    /// reveal a file that arrives on a later connection.
+    fn apply_disconnect(&mut self, device_id: &str) -> bool {
+        if let Some(phone) = self.phones.get_mut(device_id) {
+            phone.connected = false;
+        }
+        let call_changed = self.clear_call(device_id);
+        self.drop_unmatched_photo_requests(device_id);
+        call_changed
+    }
+
     fn note_send_progress(
         &mut self,
         phone: &str,
@@ -331,6 +381,107 @@ impl Shared {
         notice
     }
 
+    /// Remember a `photo_new`. Empty ids are ignored. Returns whether the strip changed.
+    fn note_photo(&mut self, phone: &str, id: &str, name: &str, taken: i64, thumb: &str) -> bool {
+        photos::remember(
+            &mut self.photos,
+            photos::RecentPhoto {
+                phone: phone.to_string(),
+                id: id.to_string(),
+                name: name.to_string(),
+                taken,
+                thumb: photos::usable_thumb(thumb),
+            },
+        )
+    }
+
+    /// One outstanding request per phone and id. A repeat click replaces the name.
+    fn queue_photo_request(&mut self, phone: &str, id: &str, name: &str) {
+        if let Some(photo) = self
+            .pending_photos
+            .iter_mut()
+            .find(|photo| photo.phone == phone && photo.id == id)
+        {
+            photo.name = name.to_string();
+            return;
+        }
+        self.pending_photos.push(PendingPhoto {
+            phone: phone.to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+        });
+    }
+
+    fn drop_photo_request(&mut self, phone: &str, id: &str) {
+        if let Some(idx) = self
+            .pending_photos
+            .iter()
+            .rposition(|photo| photo.phone == phone && photo.id == id)
+        {
+            self.pending_photos.remove(idx);
+        }
+    }
+
+    /// Drop photo requests from `phone` whose file has not arrived.
+    fn drop_unmatched_photo_requests(&mut self, phone: &str) {
+        self.pending_photos.retain(|photo| photo.phone != phone);
+    }
+
+    /// Match an offered file name to the one pending request for that phone and id.
+    ///
+    /// `offered` is the name from `file_offer` after path stripping, not the path on disk.
+    /// A ` (1)` suffix added because the name was taken is not a match: an unrelated share
+    /// of `name (1).ext` must not consume the request or reveal the wrong file.
+    fn take_pending_photo(&mut self, phone: &str, offered: &str) -> Option<String> {
+        let idx = self
+            .pending_photos
+            .iter()
+            .position(|photo| photo.phone == phone && sanitize_name(&photo.name) == offered)?;
+        Some(self.pending_photos.remove(idx).id)
+    }
+
+    fn mark_photo_saved(&mut self, phone: &str, id: &str) {
+        if let Some(row) = self
+            .saved_photos
+            .iter_mut()
+            .find(|(saved_phone, saved_id, _)| saved_phone == phone && saved_id == id)
+        {
+            row.2 = row.2.saturating_add(1);
+            return;
+        }
+        self.saved_photos
+            .push((phone.to_string(), id.to_string(), 1));
+    }
+
+    /// If this download was requested, mark that photo saved and return its id.
+    ///
+    /// `offered` is the file name the phone offered, before a duplicate suffix.
+    fn note_received_photo(&mut self, phone: &str, offered: &str) -> Option<String> {
+        let id = self.take_pending_photo(phone, offered)?;
+        self.mark_photo_saved(phone, &id);
+        Some(id)
+    }
+
+    /// Drop photo requests from `phone` waiting on an offered file named `offered`.
+    ///
+    /// Called when that transfer fails or is cancelled, so a later unrelated share with
+    /// the same name is not saved or revealed as the photo. Returns whether a request
+    /// was dropped.
+    fn fail_photo_transfer(&mut self, phone: &str, offered: &str) -> bool {
+        let offered = sanitize_name(offered);
+        let before = self.pending_photos.len();
+        self.pending_photos
+            .retain(|photo| photo.phone != phone || sanitize_name(&photo.name) != offered);
+        self.pending_photos.len() != before
+    }
+
+    fn clear_photos(&mut self, phone: &str) {
+        photos::forget_phone(&mut self.photos, phone);
+        self.drop_unmatched_photo_requests(phone);
+        self.saved_photos
+            .retain(|(saved_phone, _, _)| saved_phone != phone);
+    }
+
     /// True when a progress event should refresh the window. Finished transfers always emit.
     fn transfer_emit_due(&mut self) -> bool {
         let now = Instant::now();
@@ -382,6 +533,7 @@ impl Link {
             ring_secs: link::protocol::RING_SECS,
             sends: s.sends.iter().cloned().collect(),
             received: s.received.iter().cloned().collect(),
+            photos: photo_views(&s.photos, &s.saved_photos, &s.pending_photos),
         }
     }
 
@@ -416,7 +568,38 @@ impl Link {
         s.phones.remove(id);
         s.notifications.retain(|n| n.phone != id);
         s.clear_call(id);
+        s.clear_photos(id);
         Ok(())
+    }
+
+    /// Ask a connected phone to send a photo it announced. The file comes back
+    /// through the normal file transfer; that arrival reveals it.
+    pub fn request_photo(&self, phone: &str, id: &str) -> Result<(), String> {
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        let (msg, name) = {
+            let shared = self.shared.lock().unwrap();
+            let msg = photos::request_message(&shared.photos, phone, id).map_err(str::to_string)?;
+            let name = shared
+                .photos
+                .iter()
+                .find(|photo| photo.phone == phone && photo.id == id)
+                .map(|photo| photo.name.clone())
+                .unwrap_or_default();
+            (msg, name)
+        };
+        self.shared
+            .lock()
+            .unwrap()
+            .queue_photo_request(phone, id, &name);
+        if server.send_to(phone, msg) {
+            Ok(())
+        } else {
+            self.shared.lock().unwrap().drop_photo_request(phone, id);
+            Err("this phone is not connected".into())
+        }
     }
 
     /// Remove one notification from the window and tell that phone to cancel it.
@@ -764,6 +947,40 @@ fn received_notice(name: &str, phone: &str) -> String {
     format!("Received {name} from {phone}")
 }
 
+/// System notification text once a requested photo has been saved.
+fn photo_saved_notice(name: &str, phone: &str) -> String {
+    format!("Saved {name} from {phone}")
+}
+
+fn photo_views(
+    photos: &[photos::RecentPhoto],
+    saved: &[(String, String, u32)],
+    pending: &[PendingPhoto],
+) -> Vec<PhotoView> {
+    photos
+        .iter()
+        .map(|photo| {
+            let saves = saved
+                .iter()
+                .find(|(phone, id, _)| phone == &photo.phone && id == &photo.id)
+                .map(|(_, _, n)| *n)
+                .unwrap_or(0);
+            PhotoView {
+                phone: photo.phone.clone(),
+                id: photo.id.clone(),
+                name: photo.name.clone(),
+                taken: photo.taken,
+                thumb: photos::thumb_data_url(&photo.thumb).unwrap_or_default(),
+                saved: saves > 0,
+                saves,
+                pending: pending
+                    .iter()
+                    .any(|waiting| waiting.phone == photo.phone && waiting.id == photo.id),
+            }
+        })
+        .collect()
+}
+
 fn send_error_text(error: Option<String>) -> String {
     match error {
         Some(text) if !text.trim().is_empty() => text,
@@ -1096,6 +1313,8 @@ fn handle_event(
     let mut call_changed = false;
     let mut received_notice_text: Option<String> = None;
     let mut transfer_changed = false;
+    let mut photos_changed = false;
+    let mut reveal_photo: Option<PathBuf> = None;
     {
         let mut s = shared.lock().unwrap();
         match event {
@@ -1110,10 +1329,14 @@ fn handle_event(
                 phone.connected = true;
             }
             LinkEvent::Disconnected { device_id } => {
-                if let Some(p) = s.phones.get_mut(&device_id) {
-                    p.connected = false;
+                let dropped_photo = s
+                    .pending_photos
+                    .iter()
+                    .any(|photo| photo.phone == device_id);
+                call_changed = s.apply_disconnect(&device_id);
+                if dropped_photo {
+                    photos_changed = true;
                 }
-                call_changed = s.clear_call(&device_id);
             }
             LinkEvent::Battery {
                 device_id,
@@ -1180,16 +1403,40 @@ fn handle_event(
                     seq,
                 });
             }
-            LinkEvent::FileReceived { phone, path } => {
+            LinkEvent::FileReceived { phone, path, name } => {
                 let known = s
                     .phones
                     .get(&phone)
                     .map(|p| p.name.clone())
                     .unwrap_or_default();
                 let phone_name = phone_display_name(&known, &phone);
-                // "Received <name> from <phone>" — saved file name and the phone's name.
-                received_notice_text = Some(s.record_received(&phone, &phone_name, &path));
+                let saved_name = file_label(&path);
+                let from_photo = s.note_received_photo(&phone, &name).is_some();
+                if from_photo {
+                    photos_changed = true;
+                    reveal_photo = Some(path.clone());
+                }
+                let notice = s.record_received(&phone, &phone_name, &path);
+                received_notice_text = Some(if from_photo {
+                    photo_saved_notice(&saved_name, &phone_name)
+                } else {
+                    notice
+                });
                 transfer_changed = true;
+            }
+            LinkEvent::FileReceiveFailed { phone, name } => {
+                if s.fail_photo_transfer(&phone, &name) {
+                    photos_changed = true;
+                }
+            }
+            LinkEvent::PhotoNew {
+                device_id,
+                id,
+                name,
+                taken,
+                thumb,
+            } => {
+                photos_changed = s.note_photo(&device_id, &id, &name, taken, &thumb);
             }
             LinkEvent::FileSendProgress {
                 phone,
@@ -1251,6 +1498,15 @@ fn handle_event(
     if let (Some(text), true) = (received_notice_text, system_notifications) {
         // Headless machines have no notification service; that's fine.
         let _ = app.notification().builder().title(text).show();
+    }
+    if photos_changed {
+        let _ = app.emit("recent-photos", ());
+    }
+    if let Some(path) = reveal_photo {
+        // Finder/Explorer can be slow. Do not block the link event loop on it.
+        std::thread::spawn(move || {
+            let _ = reveal_path(&path);
+        });
     }
 }
 
@@ -2232,6 +2488,296 @@ mod tests {
         assert_eq!(
             super::macos_reveal_args(&path),
             vec!["-R".to_string(), path.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn recent_photos_dedupe_and_keep_twelve_per_phone() {
+        assert_eq!(seam_core::link::photos::KEEP_PHOTOS, 12);
+        let mut shared = Shared::default();
+        for n in 1..=12 {
+            assert!(shared.note_photo("a", &format!("p{n}"), &format!("p{n}.jpg"), n, ""));
+        }
+        assert_eq!(shared.photos.len(), 12);
+        assert_eq!(shared.photos[0].id, "p12");
+        assert_eq!(shared.photos[11].id, "p1");
+
+        assert!(shared.note_photo("a", "p3", "renamed.jpg", 99, "YQ=="));
+        assert_eq!(shared.photos.iter().filter(|p| p.id == "p3").count(), 1);
+        assert_eq!(shared.photos[0].id, "p3");
+        assert_eq!(shared.photos[0].name, "renamed.jpg");
+        assert_eq!(shared.photos[0].thumb, "YQ==");
+
+        assert!(shared.note_photo("a", "p13", "p13.jpg", 100, "@@@"));
+        assert_eq!(shared.photos.iter().filter(|p| p.phone == "a").count(), 12);
+        assert!(shared.photos.iter().all(|p| p.id != "p1"));
+        assert_eq!(
+            shared.photos.iter().find(|p| p.id == "p13").unwrap().thumb,
+            ""
+        );
+
+        assert!(shared.note_photo("b", "b1", "b.jpg", 1, "YQ=="));
+        assert_eq!(shared.photos.iter().filter(|p| p.phone == "a").count(), 12);
+        assert_eq!(shared.photos.iter().filter(|p| p.phone == "b").count(), 1);
+        assert!(!shared.note_photo("a", "", "nope.jpg", 1, ""));
+        assert_eq!(shared.photos.len(), 13);
+
+        shared.clear_photos("a");
+        assert!(shared.photos.iter().all(|p| p.phone == "b"));
+    }
+
+    #[test]
+    fn requested_photo_is_marked_saved_when_its_file_arrives() {
+        assert_eq!(
+            super::photo_saved_notice("IMG_0007.jpg", "Pixel"),
+            "Saved IMG_0007.jpg from Pixel"
+        );
+        let mut shared = Shared::default();
+        assert!(shared.note_photo("phone-a", "p1", "IMG_0007.jpg", 5, "YQ=="));
+        shared.queue_photo_request("phone-a", "p1", "IMG_0007.jpg");
+        shared.queue_photo_request("phone-a", "p1", "IMG_0007.jpg");
+        assert_eq!(shared.pending_photos.len(), 1);
+        assert!(shared.note_received_photo("phone-a", "notes.txt").is_none());
+        // A share whose offered name is already a duplicate suffix is not this photo.
+        assert!(shared
+            .note_received_photo("phone-a", "IMG_0007 (1).jpg")
+            .is_none());
+        assert_eq!(shared.pending_photos.len(), 1);
+
+        assert_eq!(
+            shared
+                .note_received_photo("phone-a", "IMG_0007.jpg")
+                .as_deref(),
+            Some("p1")
+        );
+        assert!(shared.pending_photos.is_empty());
+        let views =
+            super::photo_views(&shared.photos, &shared.saved_photos, &shared.pending_photos);
+        assert!(views[0].saved);
+        assert!(!views[0].pending);
+        assert_eq!(views[0].saves, 1);
+        assert_eq!(views[0].thumb, "data:image/jpeg;base64,YQ==");
+
+        // A second save for the same id does not duplicate the saved flag.
+        shared.queue_photo_request("phone-a", "p1", "IMG_0007.jpg");
+        assert!(shared
+            .note_received_photo("phone-a", "IMG_0007.jpg")
+            .is_some());
+        assert_eq!(shared.saved_photos.len(), 1);
+        assert_eq!(shared.saved_photos[0].2, 2);
+    }
+
+    #[test]
+    fn offered_name_does_not_consume_an_unrelated_share() {
+        let mut shared = Shared::default();
+        shared.queue_photo_request("phone-a", "p1", "../../IMG_0007.jpg");
+        shared.queue_photo_request("phone-a", "p1", "IMG_0007.jpg");
+        assert_eq!(shared.pending_photos.len(), 1);
+
+        // An unrelated share offered as `IMG_0007 (1).jpg` must not take the request.
+        assert!(shared
+            .note_received_photo("phone-a", "IMG_0007 (1).jpg")
+            .is_none());
+        assert_eq!(shared.pending_photos.len(), 1);
+        assert!(shared.saved_photos.is_empty());
+
+        assert_eq!(
+            shared
+                .note_received_photo("phone-a", "IMG_0007.jpg")
+                .as_deref(),
+            Some("p1")
+        );
+        assert!(shared.pending_photos.is_empty());
+        assert!(shared
+            .saved_photos
+            .iter()
+            .any(|(phone, id, saves)| phone == "phone-a" && id == "p1" && *saves == 1));
+    }
+
+    #[test]
+    fn disconnect_drops_unmatched_photo_requests() {
+        let mut shared = Shared::default();
+        shared.phones.insert(
+            "phone-a".into(),
+            PhoneView {
+                id: "phone-a".into(),
+                name: "Pixel".into(),
+                connected: true,
+                battery: None,
+            },
+        );
+        shared.apply_call("phone-a", CallState::Ringing, "", "Ada");
+        assert!(shared.note_photo("phone-a", "p1", "IMG_0007.jpg", 1, ""));
+        shared.queue_photo_request("phone-a", "p1", "IMG_0007.jpg");
+        shared.queue_photo_request("phone-b", "p2", "keep.jpg");
+
+        assert!(shared.apply_disconnect("phone-a"));
+        assert_eq!(
+            shared.phones.get("phone-a").map(|phone| phone.connected),
+            Some(false)
+        );
+        assert!(shared.call.is_none());
+        assert!(shared
+            .pending_photos
+            .iter()
+            .all(|photo| photo.phone != "phone-a"));
+        assert_eq!(shared.photos.len(), 1);
+        // A later share must not be revealed, even if the offered name matches.
+        assert!(shared
+            .note_received_photo("phone-a", "IMG_0007.jpg")
+            .is_none());
+        assert!(shared
+            .note_received_photo("phone-a", "IMG_0007 (1).jpg")
+            .is_none());
+        assert!(shared.saved_photos.is_empty());
+        assert_eq!(
+            shared.note_received_photo("phone-b", "keep.jpg").as_deref(),
+            Some("p2")
+        );
+    }
+
+    #[test]
+    fn link_status_lists_recent_photos_as_data_urls() {
+        let link = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        {
+            let mut shared = link.shared.lock().unwrap();
+            assert!(shared.note_photo("phone-a", "p1", "old.jpg", 1, "@@@"));
+            assert!(shared.note_photo("phone-a", "p2", "new.jpg", 2, "YQ=="));
+            shared.mark_photo_saved("phone-a", "p2");
+        }
+        let json = serde_json::to_value(link.status()).unwrap();
+        let photos = json["photos"].as_array().unwrap();
+        assert_eq!(photos.len(), 2);
+        assert_eq!(photos[0]["id"], "p2");
+        assert_eq!(photos[0]["phone"], "phone-a");
+        assert_eq!(photos[0]["name"], "new.jpg");
+        assert_eq!(photos[0]["taken"], 2);
+        assert_eq!(photos[0]["thumb"], "data:image/jpeg;base64,YQ==");
+        assert_eq!(photos[0]["saved"], true);
+        assert_eq!(photos[0]["saves"], 1);
+        assert_eq!(photos[0]["pending"], false);
+        assert_eq!(photos[1]["id"], "p1");
+        assert_eq!(photos[1]["thumb"], "");
+        assert_eq!(photos[1]["saved"], false);
+        assert_eq!(photos[1]["saves"], 0);
+        assert_eq!(photos[1]["pending"], false);
+        assert!(photos[0].get("notification").is_none());
+    }
+
+    #[test]
+    fn request_photo_needs_a_known_photo_on_a_connected_phone() {
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            offline.request_photo("phone-a", "p1").unwrap_err(),
+            "the phone link is not running"
+        );
+
+        let dir = std::env::temp_dir().join(format!("seam-photo-req-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Desk".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        link.shared
+            .lock()
+            .unwrap()
+            .note_photo("phone-a", "p1", "IMG_0007.jpg", 1, "YQ==");
+        assert_eq!(
+            link.request_photo("phone-a", "missing").unwrap_err(),
+            "unknown photo"
+        );
+        assert_eq!(
+            link.request_photo("phone-a", "").unwrap_err(),
+            "unknown photo"
+        );
+        assert_eq!(
+            link.request_photo("phone-a", "p1").unwrap_err(),
+            "this phone is not connected"
+        );
+        assert!(link.shared.lock().unwrap().pending_photos.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_drops_only_that_phones_photos() {
+        let dir = std::env::temp_dir().join(format!("seam-photo-forget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Desk".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.note_photo("phone-a", "p1", "a.jpg", 1, "");
+            shared.note_photo("phone-b", "p2", "b.jpg", 2, "");
+            shared.queue_photo_request("phone-a", "p1", "a.jpg");
+            shared.mark_photo_saved("phone-a", "p1");
+            shared.mark_photo_saved("phone-b", "p2");
+        }
+        link.forget("phone-a").unwrap();
+        let photos = link.status().photos;
+        assert_eq!(photos.len(), 1);
+        assert_eq!(photos[0].phone, "phone-b");
+        assert_eq!(photos[0].id, "p2");
+        assert!(photos[0].saved);
+        assert!(link.shared.lock().unwrap().pending_photos.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_receive_drops_only_the_matching_photo_request() {
+        let mut shared = Shared::default();
+        assert!(shared.note_photo("phone-a", "p1", "../../IMG_0007.jpg", 1, "YQ=="));
+        shared.mark_photo_saved("phone-a", "p1");
+        shared.queue_photo_request("phone-a", "p1", "../../IMG_0007.jpg");
+        shared.queue_photo_request("phone-b", "p2", "keep.jpg");
+        let mid = super::photo_views(&shared.photos, &shared.saved_photos, &shared.pending_photos);
+        assert!(mid[0].pending);
+        assert_eq!(mid[0].saves, 1);
+        assert!(mid[0].saved);
+
+        assert!(!shared.fail_photo_transfer("phone-a", "notes.txt"));
+        assert_eq!(shared.pending_photos.len(), 2);
+        assert!(shared.fail_photo_transfer("phone-a", "IMG_0007.jpg"));
+        assert!(shared
+            .pending_photos
+            .iter()
+            .all(|photo| photo.phone != "phone-a"));
+        assert_eq!(shared.pending_photos.len(), 1);
+
+        let after =
+            super::photo_views(&shared.photos, &shared.saved_photos, &shared.pending_photos);
+        assert!(!after[0].pending);
+        assert_eq!(
+            after[0].saves, 1,
+            "a failed transfer must not count as a new save"
+        );
+        assert!(shared
+            .note_received_photo("phone-a", "IMG_0007.jpg")
+            .is_none());
+        assert_eq!(shared.saved_photos.len(), 1);
+
+        shared.queue_photo_request("phone-a", "p1", "IMG_0007.jpg");
+        assert_eq!(
+            shared
+                .note_received_photo("phone-a", "IMG_0007.jpg")
+                .as_deref(),
+            Some("p1")
+        );
+        let done = super::photo_views(&shared.photos, &shared.saved_photos, &shared.pending_photos);
+        assert!(!done[0].pending);
+        assert_eq!(done[0].saves, 2);
+        assert_eq!(
+            shared.note_received_photo("phone-b", "keep.jpg").as_deref(),
+            Some("p2")
         );
     }
 }

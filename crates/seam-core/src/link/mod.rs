@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod mdns;
+pub mod photos;
 pub mod protocol;
 pub mod server;
 pub mod store;

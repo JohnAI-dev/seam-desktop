@@ -180,6 +180,19 @@ pub enum Message {
     FileCancel {
         transfer: String,
     },
+    /// Phone → desktop: a new photo or screenshot was saved. `thumb` is standard base64 JPEG.
+    PhotoNew {
+        id: String,
+        name: String,
+        /// Milliseconds since the epoch.
+        taken: i64,
+        /// Base64 JPEG thumbnail, at most 32 KiB, longest side 256 px.
+        thumb: String,
+    },
+    /// Desktop → phone: send this photo with the normal file transfer.
+    PhotoRequest {
+        id: String,
+    },
     Ping,
     Pong,
     /// Any message type this build doesn't know. Ignored, so newer phones still work.
@@ -739,6 +752,34 @@ mod tests {
             r#"{"type":"file_cancel","transfer":"00112233445566778899aabbccddeeff"}"#,
         );
         assert_eq!(Message::from_line(&cancel.to_line()).unwrap(), cancel);
+    }
+
+    #[test]
+    fn photo_new_and_photo_request_round_trip() {
+        let photo = Message::PhotoNew {
+            id: "media-42".into(),
+            name: "IMG_0042.jpg".into(),
+            taken: 1_760_000_000_000,
+            thumb: "/9j/4AAQ".into(),
+        };
+        assert_eq!(
+            photo.to_line(),
+            r#"{"type":"photo_new","id":"media-42","name":"IMG_0042.jpg","taken":1760000000000,"thumb":"/9j/4AAQ"}"#,
+        );
+        assert_eq!(Message::from_line(&photo.to_line()).unwrap(), photo);
+
+        let request = Message::PhotoRequest {
+            id: "media-42".into(),
+        };
+        assert_eq!(
+            request.to_line(),
+            r#"{"type":"photo_request","id":"media-42"}"#,
+        );
+        assert_eq!(Message::from_line(&request.to_line()).unwrap(), request);
+        assert_eq!(
+            Message::from_line(r#"{"type":"photo_request","id":"media-42"}"#).unwrap(),
+            request
+        );
     }
 
     #[test]
