@@ -90,6 +90,24 @@ pub enum LinkEvent {
         phone: String,
         /// Final path of the saved file.
         path: PathBuf,
+        /// Offered file name after path stripping, before a ` (1)` duplicate suffix.
+        name: String,
+    },
+    /// An inbound transfer failed, was rejected, or was cancelled.
+    ///
+    /// `name` is the offered file name after path stripping. A photo request waiting
+    /// on that name is no longer outstanding.
+    FileReceiveFailed {
+        phone: String,
+        name: String,
+    },
+    /// Phone announced a new photo or screenshot. `thumb` is standard base64 JPEG.
+    PhotoNew {
+        device_id: String,
+        id: String,
+        name: String,
+        taken: i64,
+        thumb: String,
     },
     /// Bytes of an outbound file have been handed to the phone's connection.
     FileSendProgress {
@@ -578,6 +596,19 @@ impl LinkServer {
         Ok(true)
     }
 
+    /// Tell the window an inbound transfer failed or was cancelled.
+    ///
+    /// `name` is the offered file name after path stripping. Empty names are ignored.
+    fn fail_receive(&self, phone: &str, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        let _ = self.inner.events.send(LinkEvent::FileReceiveFailed {
+            phone: phone.to_string(),
+            name: name.to_string(),
+        });
+    }
+
     /// Handle one inbound file frame. Other messages are returned so the session can emit them.
     async fn handle_file<W: tokio::io::AsyncWrite + Unpin>(
         &self,
@@ -593,6 +624,7 @@ impl LinkServer {
                 size,
                 ..
             } => {
+                let offered = transfer::sanitize_name(&name);
                 if let Err(reason) = transfer::check_offer(&transfer, size) {
                     send(
                         writer,
@@ -602,9 +634,21 @@ impl LinkServer {
                         },
                     )
                     .await?;
+                    // A rejected offer will not arrive. Leave an in-progress transfer of the
+                    // same name alone so a retry does not clear its photo request.
+                    let continuing = inbound
+                        .as_ref()
+                        .is_some_and(|file| file.offered_name() == offered);
+                    if !continuing {
+                        self.fail_receive(device_id, &offered);
+                    }
                 } else {
                     // Drop a partial first so its cleanup cannot remove the new temp file.
-                    inbound.take();
+                    if let Some(prev) = inbound.take() {
+                        if prev.offered_name() != offered {
+                            self.fail_receive(device_id, prev.offered_name());
+                        }
+                    }
                     match transfer::Inbound::open(&self.inner.download_dir, &transfer, &name, size)
                     {
                         Ok(file) => {
@@ -620,6 +664,7 @@ impl LinkServer {
                                 },
                             )
                             .await?;
+                            self.fail_receive(device_id, &offered);
                         }
                     }
                 }
@@ -630,12 +675,16 @@ impl LinkServer {
                 seq,
                 data,
             } => {
+                let offered = inbound.as_ref().map(|file| file.offered_name().to_string());
                 let failed = match inbound.as_mut() {
                     Some(file) => file.push_chunk(&transfer, seq, &data).err(),
                     None => Some("no transfer".to_string()),
                 };
                 if let Some(reason) = failed {
                     inbound.take();
+                    if let Some(name) = &offered {
+                        self.fail_receive(device_id, name);
+                    }
                     send(
                         writer,
                         &Message::FileResult {
@@ -649,12 +698,16 @@ impl LinkServer {
                 Ok(None)
             }
             Message::FileDone { transfer, sha256 } => {
-                let result = match inbound.take() {
-                    Some(file) => file.finish(&self.inner.download_dir, &transfer, &sha256),
-                    None => Err("no transfer".to_string()),
+                let (offered, result) = match inbound.take() {
+                    Some(file) => {
+                        let offered = file.offered_name().to_string();
+                        let result = file.finish(&self.inner.download_dir, &transfer, &sha256);
+                        (Some(offered), result)
+                    }
+                    None => (None, Err("no transfer".to_string())),
                 };
                 match result {
-                    Ok(path) => {
+                    Ok((path, name)) => {
                         send(
                             writer,
                             &Message::FileResult {
@@ -667,9 +720,13 @@ impl LinkServer {
                         let _ = self.inner.events.send(LinkEvent::FileReceived {
                             phone: device_id.to_string(),
                             path,
+                            name,
                         });
                     }
                     Err(reason) => {
+                        if let Some(name) = &offered {
+                            self.fail_receive(device_id, name);
+                        }
                         send(
                             writer,
                             &Message::FileResult {
@@ -688,7 +745,9 @@ impl LinkServer {
                     .as_ref()
                     .is_some_and(|file| file.is_transfer(&transfer))
                 {
-                    inbound.take();
+                    if let Some(file) = inbound.take() {
+                        self.fail_receive(device_id, file.offered_name());
+                    }
                 }
                 Ok(None)
             }
@@ -758,6 +817,15 @@ impl LinkServer {
                             number,
                             name,
                         }),
+                        Message::PhotoNew { id: photo_id, name, taken, thumb } => {
+                            Some(LinkEvent::PhotoNew {
+                                device_id: id,
+                                id: photo_id,
+                                name,
+                                taken,
+                                thumb,
+                            })
+                        }
                         Message::Pong => { missed_pongs = 0; None }
                         Message::Ping => { send(writer, &Message::Pong).await?; None }
                         _ => None,
@@ -1277,6 +1345,13 @@ mod tests {
         .await;
         assert!(matches!(huge, Some(Message::FileReject { .. })));
         assert!(inbound.is_none());
+        match events.try_recv().unwrap() {
+            LinkEvent::FileReceiveFailed { phone, name } => {
+                assert_eq!(phone, "phone-1");
+                assert_eq!(name, "huge.bin");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
 
         let accept = drive(
             &server,
@@ -1325,9 +1400,10 @@ mod tests {
             })
         );
         match events.try_recv().unwrap() {
-            LinkEvent::FileReceived { phone, path } => {
+            LinkEvent::FileReceived { phone, path, name } => {
                 assert_eq!(phone, "phone-1");
                 assert_eq!(path, download.join("passwd"));
+                assert_eq!(name, "passwd");
                 assert_eq!(std::fs::read(&path).unwrap(), b"hello");
             }
             other => panic!("unexpected event: {other:?}"),
@@ -1376,6 +1452,13 @@ mod tests {
         assert!(!download.join("evil.bin").exists());
         assert_eq!(std::fs::read(download.join("passwd")).unwrap(), b"hello");
         assert!(partials(&download).is_empty());
+        match events.try_recv().unwrap() {
+            LinkEvent::FileReceiveFailed { phone, name } => {
+                assert_eq!(phone, "phone-1");
+                assert_eq!(name, "evil.bin");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
         assert!(events.try_recv().is_err());
 
         let cancel_id = "ef".repeat(16);
@@ -1384,7 +1467,7 @@ mod tests {
             &mut inbound,
             Message::FileOffer {
                 transfer: cancel_id.clone(),
-                name: "partial.bin".into(),
+                name: "../../partial.bin".into(),
                 size: 4,
                 mime: None,
             },
@@ -1413,6 +1496,13 @@ mod tests {
         assert!(inbound.is_none());
         assert!(partials(&download).is_empty());
         assert!(!download.join("partial.bin").exists());
+        match events.try_recv().unwrap() {
+            LinkEvent::FileReceiveFailed { phone, name } => {
+                assert_eq!(phone, "phone-1");
+                assert_eq!(name, "partial.bin");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
 
         let seq_id = "12".repeat(16);
         drive(
@@ -1443,6 +1533,10 @@ mod tests {
         assert!(inbound.is_none());
         assert!(!download.join("seq.bin").exists());
         assert!(partials(&download).is_empty());
+        match events.try_recv().unwrap() {
+            LinkEvent::FileReceiveFailed { name, .. } => assert_eq!(name, "seq.bin"),
+            other => panic!("unexpected event: {other:?}"),
+        }
 
         let big_id = "34".repeat(16);
         drive(
@@ -1472,6 +1566,10 @@ mod tests {
         ));
         assert!(!download.join("big.bin").exists());
         assert!(partials(&download).is_empty());
+        match events.try_recv().unwrap() {
+            LinkEvent::FileReceiveFailed { name, .. } => assert_eq!(name, "big.bin"),
+            other => panic!("unexpected event: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

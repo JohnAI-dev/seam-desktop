@@ -502,8 +502,9 @@ async fn phone_sends_a_file_and_a_wrong_hash_leaves_nothing() {
         }
     );
     match next_event(&mut events).await {
-        LinkEvent::FileReceived { phone, path } => {
+        LinkEvent::FileReceived { phone, path, name } => {
             assert_eq!(phone, "phone-1");
+            assert_eq!(name, "passwd");
             assert_eq!(path.parent(), Some(download.as_path()));
             assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("passwd"));
             assert_eq!(std::fs::read(&path).unwrap(), payload);
@@ -605,6 +606,13 @@ async fn phone_sends_a_file_and_a_wrong_hash_leaves_nothing() {
         } => assert_eq!(transfer, bad_id),
         other => panic!("expected file_result ok:false, got {other:?}"),
     }
+    match next_event(&mut events).await {
+        LinkEvent::FileReceiveFailed { phone, name } => {
+            assert_eq!(phone, "phone-1");
+            assert_eq!(name, "evil.bin");
+        }
+        other => panic!("expected a failed receive, got {other:?}"),
+    }
     assert_eq!(file_names(&download), before);
     assert!(!download.join("evil.bin").exists());
     assert!(file_names(&download).iter().all(|n| !n.ends_with(".part")));
@@ -646,6 +654,13 @@ async fn phone_sends_a_file_and_a_wrong_hash_leaves_nothing() {
         })
         .await
         .unwrap();
+    match next_event(&mut events).await {
+        LinkEvent::FileReceiveFailed { phone, name } => {
+            assert_eq!(phone, "phone-1");
+            assert_eq!(name, "partial.bin");
+        }
+        other => panic!("expected a cancelled receive, got {other:?}"),
+    }
     assert_eq!(
         next_event(&mut events).await,
         LinkEvent::Battery {
@@ -658,6 +673,61 @@ async fn phone_sends_a_file_and_a_wrong_hash_leaves_nothing() {
     assert!(file_names(&download).iter().all(|n| !n.ends_with(".part")));
     assert_eq!(file_names(&download), before);
     assert_eq!(std::fs::read(download.join("passwd (1)")).unwrap(), second);
+}
+
+#[tokio::test]
+async fn phone_announces_a_photo_and_receives_the_request() {
+    let (server, mut events, port) = start("photo").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+
+    let thumb = STANDARD.encode(b"\xff\xd8\xff tiny-jpeg");
+    phone
+        .send(&Message::PhotoNew {
+            id: "media-7".into(),
+            name: "IMG_0007.jpg".into(),
+            taken: 1_760_000_000_000,
+            thumb: thumb.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::PhotoNew {
+            device_id: "phone-1".into(),
+            id: "media-7".into(),
+            name: "IMG_0007.jpg".into(),
+            taken: 1_760_000_000_000,
+            thumb,
+        }
+    );
+
+    let request = Message::PhotoRequest {
+        id: "media-7".into(),
+    };
+    assert!(server.send_to("phone-1", request.clone()));
+    let got = next_msg(&mut phone).await;
+    assert_eq!(got.to_line(), r#"{"type":"photo_request","id":"media-7"}"#);
+    assert_eq!(got, request);
+
+    phone
+        .send(&Message::Battery {
+            level: 40,
+            charging: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-1".into(),
+            level: 40,
+            charging: false,
+        }
+    );
 }
 
 #[tokio::test]

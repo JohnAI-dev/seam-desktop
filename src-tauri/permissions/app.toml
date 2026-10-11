@@ -1,0 +1,29 @@
+# Commands the main window may call. Named from the capability so request_photo
+# is allowed even when IPC commands are capability-allowlisted.
+[[permission]]
+identifier = "seam-commands"
+description = "Commands the Seam window is allowed to call."
+commands.allow = [
+  "status",
+  "start_mirror",
+  "link_status",
+  "start_pairing",
+  "forget_phone",
+  "dismiss_notification",
+  "reply_notification",
+  "call_action",
+  "ring_phone",
+  "send_clipboard",
+  "pick_file",
+  "send_file",
+  "cancel_file_send",
+  "reveal_file",
+  "handle_file_drop",
+  "update_status",
+  "restart_to_update",
+  "wireless_status",
+  "start_wireless_pairing",
+  "cancel_wireless_pairing",
+  "request_photo",
+  "frontend_ready",
+]
