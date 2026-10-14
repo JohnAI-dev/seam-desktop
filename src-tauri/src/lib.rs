@@ -2,6 +2,7 @@
 
 mod link;
 mod open_url;
+mod tray;
 mod updates;
 mod wireless;
 
@@ -97,8 +98,22 @@ fn start_pairing(phone_link: State<link::Link>) -> Result<link::PairingView, Str
 }
 
 #[tauri::command]
-fn forget_phone(phone_link: State<link::Link>, id: String) -> Result<(), String> {
-    phone_link.forget(&id)
+fn forget_phone(app: AppHandle, phone_link: State<link::Link>, id: String) -> Result<(), String> {
+    phone_link.forget(&id)?;
+    tray::refresh(&app);
+    Ok(())
+}
+
+/// Whether Seam is registered to open at login. Off until the person turns it on.
+#[tauri::command]
+fn autostart_enabled(app: AppHandle) -> bool {
+    tray::autostart_enabled(&app)
+}
+
+/// Turn start-at-login on or off, and keep the tray checkbox in step.
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    tray::set_autostart(&app, enabled)
 }
 
 #[tauri::command]
@@ -263,15 +278,26 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(updates::Updates::default())
         .manage(SelfTest(self_test))
+        .manage(tray::RunFlags::default())
         .setup(move |app| {
             use_bundled_tools(app.handle());
             open_url::install(app.handle());
             app.manage(link::start(app.handle(), !self_test));
             link::watch_drops(app.handle());
             app.manage(wireless::start(app.handle()));
+            tray::install_window_behavior(app.handle());
+            // No tray in the headless self-test: creating one can wait forever
+            // when the virtual display has no status bar, and the test would hang.
             if !self_test {
+                if let Err(e) = tray::install(app.handle()) {
+                    eprintln!("Seam: tray icon unavailable: {e}");
+                }
                 updates::start(app.handle());
             }
             Ok(())
@@ -302,6 +328,8 @@ pub fn run() {
             open_url::pending_links,
             open_url::send_open_url,
             open_url::open_link,
+            autostart_enabled,
+            set_autostart,
             frontend_ready
         ])
         .run(tauri::generate_context!())
@@ -342,5 +370,20 @@ mod capability_tests {
         let perm = include_str!("../permissions/app.toml");
         assert!(caps.contains("seam-commands"));
         assert!(perm.contains("set_dnd"), "seam-commands must allow set_dnd");
+    }
+
+    #[test]
+    fn autostart_commands_are_allowed_for_the_window() {
+        let caps = include_str!("../capabilities/default.json");
+        let perm = include_str!("../permissions/app.toml");
+        assert!(caps.contains("seam-commands"));
+        assert!(
+            perm.contains("autostart_enabled"),
+            "seam-commands must allow autostart_enabled"
+        );
+        assert!(
+            perm.contains("set_autostart"),
+            "seam-commands must allow set_autostart"
+        );
     }
 }
