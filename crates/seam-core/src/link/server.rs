@@ -171,6 +171,8 @@ struct Inner {
     open_urls: Mutex<Vec<IncomingLink>>,
     /// Latest media session per connected phone. Cleared on `media_stopped` and disconnect.
     media: Mutex<media::Sessions>,
+    /// When set, every message received from a phone is copied here.
+    received_log: Mutex<Option<mpsc::UnboundedSender<Message>>>,
 }
 
 /// Servers still alive, so the window can list links without the UI state type.
@@ -230,6 +232,7 @@ impl LinkServer {
             unauth: Mutex::new(0),
             open_urls: Mutex::new(Vec::new()),
             media: Mutex::new(media::Sessions::default()),
+            received_log: Mutex::new(None),
         };
         let inner = Arc::new(inner);
         register_live(&inner);
@@ -441,6 +444,18 @@ impl LinkServer {
     pub fn start_pairing(&self, hosts: Vec<String>, port: u16) -> PairingInfo {
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
+        self.start_pairing_with_key(hosts, port, key)
+    }
+
+    /// Start pairing with a chosen one-time key. The key must be 32 bytes.
+    ///
+    /// Used by `seam-testpeer` so a test can print a pairing link it already knows.
+    pub fn start_pairing_with_key(
+        &self,
+        hosts: Vec<String>,
+        port: u16,
+        key: [u8; 32],
+    ) -> PairingInfo {
         *self.inner.pending.lock().unwrap() = Some(Pending {
             key,
             created: Instant::now(),
@@ -451,6 +466,18 @@ impl LinkServer {
             fingerprint: self.inner.fingerprint.clone(),
             key,
             name: self.inner.desktop_name.clone(),
+        }
+    }
+
+    /// Copy every message received from a phone (the hello, and later frames) to `tx`.
+    pub fn log_received_messages(&self, tx: mpsc::UnboundedSender<Message>) {
+        *self.inner.received_log.lock().unwrap() = Some(tx);
+    }
+
+    fn note_received(&self, msg: &Message) {
+        let log = self.inner.received_log.lock().unwrap();
+        if let Some(tx) = log.as_ref() {
+            let _ = tx.send(msg.clone());
         }
     }
 
@@ -545,7 +572,14 @@ impl LinkServer {
                 device_id,
                 name,
                 proof,
-            }) => (device_id, name, proof),
+            }) => {
+                self.note_received(&Message::Hello {
+                    device_id: device_id.clone(),
+                    name: name.clone(),
+                    proof: proof.clone(),
+                });
+                (device_id, name, proof)
+            }
             _ => return reject(&mut writer, "expected hello").await,
         };
 
@@ -882,7 +916,10 @@ impl LinkServer {
                         // Malformed media frames are dropped in the reader, before this.
                         // Any other bad frame still ends the link.
                         Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                        Some(Ok(m)) => m,
+                        Some(Ok(m)) => {
+                            self.note_received(&m);
+                            m
+                        }
                     };
                     // A forgotten phone is disconnected on its next message.
                     if self.inner.store.device(device_id).is_none() {
