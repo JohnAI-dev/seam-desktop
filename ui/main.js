@@ -558,14 +558,23 @@ function renderCall(call) {
   const box = document.getElementById("call");
   if (!box) return;
   const caller = document.getElementById("call-caller");
-  if (!call || call.state !== "ringing" || typeof call.phone !== "string" || !call.phone) {
+  const summary = document.getElementById("calls-summary");
+  const ringing = call && call.state === "ringing" && typeof call.phone === "string" && call.phone;
+  if (!ringing) {
     box.hidden = true;
     delete box.dataset.phone;
+    if (summary) {
+      summary.textContent = "No incoming call. A ringing call stays at the top of the window, with Decline and Silence.";
+    }
     return;
   }
-  if (caller) caller.textContent = call.caller || "Unknown caller";
+  const label = call.caller || "Unknown caller";
+  if (caller) caller.textContent = label;
   box.dataset.phone = call.phone;
   box.hidden = false;
+  if (summary) {
+    summary.textContent = `Incoming call from ${label}. Decline and Silence are at the top of the window.`;
+  }
 }
 
 // Find my phone. The phone rings until Stop, its "Found it" button, or ring_secs.
@@ -819,6 +828,141 @@ function listenForOpenUrls() {
   }
 }
 
+function phoneMeta(p) {
+  let meta = p.connected ? "Connected over Wi-Fi" : "Not connected";
+  if (p.connected && p.battery) meta += ` · ${p.battery[0]}%${p.battery[1] ? " ⚡" : ""}`;
+  meta += p.dnd ? " · Do Not Disturb on" : " · Do Not Disturb off";
+  return meta;
+}
+
+function phoneInfo(p) {
+  return el(
+    "div",
+    { className: "info" },
+    el("div", { className: "name" }, el("span", { className: `dot${p.connected ? " on" : ""}` }), p.name),
+    el("div", { className: "meta", textContent: phoneMeta(p) }),
+  );
+}
+
+function renderHeader(link) {
+  const nameEl = document.getElementById("header-name");
+  const metaEl = document.getElementById("header-meta");
+  if (!nameEl || !metaEl) return;
+  const phones = link.phones || [];
+  if (!phones.length) {
+    nameEl.textContent = "No phone paired";
+    metaEl.textContent = "Not connected";
+    return;
+  }
+  const connected = phones.filter((p) => p.connected);
+  const phone = connected[0] || phones[0];
+  nameEl.textContent = phones.length === 1 ? phone.name : `${phone.name} · ${phones.length} phones`;
+  let meta = phone.connected ? "Connected" : "Not connected";
+  if (phone.connected && phone.battery) {
+    meta += ` · ${phone.battery[0]}%`;
+    if (phone.battery[1]) meta += " ⚡";
+  }
+  metaEl.textContent = meta;
+}
+
+function forgetButton(p) {
+  const forget = el("button", { type: "button", className: "link", textContent: "Forget" });
+  forget.addEventListener("click", async () => {
+    if (!confirm(`Forget ${p.name}? You'll need to pair it again.`)) return;
+    try { await invoke("forget_phone", { id: p.id }); await refresh(); } catch (e) { showLinkError(String(e)); }
+  });
+  return forget;
+}
+
+function sendFileButton(p) {
+  const sendFile = el("button", {
+    type: "button",
+    className: "secondary",
+    textContent: "Send file\u2026",
+  });
+  sendFile.addEventListener("click", async () => {
+    sendFile.disabled = true;
+    try {
+      await chooseAndSendFile(p.id, p.name);
+    } finally {
+      sendFile.disabled = false;
+    }
+  });
+  return sendFile;
+}
+
+function ringButton(p) {
+  const ringing = isRinging(p.id);
+  const ring = el("button", {
+    type: "button",
+    className: ringing ? "secondary ring-stop" : "secondary",
+    textContent: ringing ? "Stop" : "Ring",
+    title: ringing ? "Stop ringing" : "Ring phone",
+  });
+  ring.addEventListener("click", async () => {
+    const stop = isRinging(p.id);
+    ring.disabled = true;
+    try {
+      await invoke("ring_phone", { id: p.id, action: stop ? "ring_stop" : "ring" });
+      if (stop) stopRinging(p.id);
+      else beginRinging(p.id);
+      showLinkError(null);
+      if (lastLink) renderLink(lastLink);
+    } catch (e) {
+      showLinkError(String(e));
+    } finally {
+      ring.disabled = false;
+    }
+  });
+  return ring;
+}
+
+function clipboardButton(p) {
+  const send = el("button", {
+    type: "button",
+    className: "secondary",
+    textContent: "Send clipboard",
+  });
+  send.addEventListener("click", async () => {
+    send.disabled = true;
+    try {
+      await invoke("send_clipboard", { id: p.id });
+      showLinkError(null);
+      showLinkConfirm(`Clipboard sent to ${p.name}.`);
+    } catch (e) {
+      showLinkConfirm(null);
+      showLinkError(String(e));
+    } finally {
+      send.disabled = false;
+    }
+  });
+  return send;
+}
+
+function silenceButton(p) {
+  const silence = el("button", {
+    type: "button",
+    className: p.dnd ? "secondary dnd-on" : "secondary",
+    textContent: "Silence phone",
+    title: p.dnd ? "Do Not Disturb is on" : "Turn on Do Not Disturb",
+  });
+  silence.setAttribute("aria-pressed", p.dnd ? "true" : "false");
+  silence.disabled = !p.connected;
+  silence.addEventListener("click", async () => {
+    silence.disabled = true;
+    try {
+      await invoke("set_dnd", { phone: p.id, on: !p.dnd });
+      showLinkError(null);
+      await refreshLink();
+    } catch (e) {
+      showLinkError(String(e));
+    } finally {
+      silence.disabled = !p.connected;
+    }
+  });
+  return silence;
+}
+
 function renderLink(link) {
   lastLink = link;
   pruneRinging(link);
@@ -831,108 +975,35 @@ function renderLink(link) {
       composers.delete(key);
     }
   }
+  renderHeader(link);
   const focusedSendLink = captureSendLinkFocus();
   const list = document.getElementById("linked");
   list.replaceChildren(
-    ...link.phones.map((p) => {
-      let meta = p.connected ? "Connected over Wi-Fi" : "Not connected";
-      if (p.connected && p.battery) meta += ` · ${p.battery[0]}%${p.battery[1] ? " ⚡" : ""}`;
-      meta += p.dnd ? " · Do Not Disturb on" : " · Do Not Disturb off";
-      const forget = el("button", { className: "link", textContent: "Forget" });
-      forget.addEventListener("click", async () => {
-        if (!confirm(`Forget ${p.name}? You'll need to pair it again.`)) return;
-        try { await invoke("forget_phone", { id: p.id }); await refresh(); } catch (e) { showLinkError(String(e)); }
-      });
-      const buttons = [];
-      if (p.connected) {
-        const sendFile = el("button", {
-          type: "button",
-          className: "secondary",
-          textContent: "Send file\u2026",
-        });
-        sendFile.addEventListener("click", async () => {
-          sendFile.disabled = true;
-          try {
-            await chooseAndSendFile(p.id, p.name);
-          } finally {
-            sendFile.disabled = false;
-          }
-        });
-        const ringing = isRinging(p.id);
-        const ring = el("button", {
-          type: "button",
-          className: ringing ? "secondary ring-stop" : "secondary",
-          textContent: ringing ? "Stop" : "Ring",
-          title: ringing ? "Stop ringing" : "Ring phone",
-        });
-        ring.addEventListener("click", async () => {
-          const stop = isRinging(p.id);
-          ring.disabled = true;
-          try {
-            await invoke("ring_phone", { id: p.id, action: stop ? "ring_stop" : "ring" });
-            if (stop) stopRinging(p.id);
-            else beginRinging(p.id);
-            showLinkError(null);
-            if (lastLink) renderLink(lastLink);
-          } catch (e) {
-            showLinkError(String(e));
-          } finally {
-            ring.disabled = false;
-          }
-        });
-        const send = el("button", {
-          type: "button",
-          className: "secondary",
-          textContent: "Send clipboard",
-        });
-        send.addEventListener("click", async () => {
-          send.disabled = true;
-          try {
-            await invoke("send_clipboard", { id: p.id });
-            showLinkError(null);
-            showLinkConfirm(`Clipboard sent to ${p.name}.`);
-          } catch (e) {
-            showLinkConfirm(null);
-            showLinkError(String(e));
-          } finally {
-            send.disabled = false;
-          }
-        });
-        buttons.push(sendFile, ring, send);
-      }
-      const silence = el("button", {
-        type: "button",
-        className: p.dnd ? "secondary dnd-on" : "secondary",
-        textContent: "Silence phone",
-        title: p.dnd ? "Do Not Disturb is on" : "Turn on Do Not Disturb",
-      });
-      silence.setAttribute("aria-pressed", p.dnd ? "true" : "false");
-      silence.disabled = !p.connected;
-      silence.addEventListener("click", async () => {
-        silence.disabled = true;
-        try {
-          await invoke("set_dnd", { phone: p.id, on: !p.dnd });
-          showLinkError(null);
-          await refreshLink();
-        } catch (e) {
-          showLinkError(String(e));
-        } finally {
-          silence.disabled = !p.connected;
-        }
-      });
-      buttons.push(silence);
-      buttons.push(forget);
-      const row = [
-        el("div", { className: "info" },
-          el("div", { className: "name" }, el("span", { className: `dot${p.connected ? " on" : ""}` }), p.name),
-          el("div", { className: "meta", textContent: meta })),
-        ...buttons,
-      ];
-      if (p.connected) row.push(sendLinkControls(p));
-      return el("li", { className: "device" }, ...row);
-    }),
+    ...link.phones.map((p) => el("li", { className: "device" }, phoneInfo(p), forgetButton(p))),
   );
   document.getElementById("linked-empty").hidden = link.phones.length > 0;
+  const actions = document.getElementById("phone-actions");
+  const actionsEmpty = document.getElementById("phone-actions-empty");
+  if (actions) {
+    actions.replaceChildren(
+      ...link.phones.map((p) => {
+        const row = [phoneInfo(p)];
+        if (p.connected) row.push(ringButton(p), clipboardButton(p));
+        row.push(silenceButton(p));
+        if (p.connected) row.push(sendLinkControls(p));
+        return el("li", { className: "device" }, ...row);
+      }),
+    );
+  }
+  if (actionsEmpty) actionsEmpty.hidden = link.phones.length > 0;
+  const sendFiles = document.getElementById("send-files");
+  if (sendFiles) {
+    sendFiles.replaceChildren(
+      ...link.phones.filter((p) => p.connected).map((p) =>
+        el("li", { className: "device" }, phoneInfo(p), sendFileButton(p)),
+      ),
+    );
+  }
 
   const focusedReply = captureReplyFocus();
   for (const n of link.notifications) absorbStatusReply(n);
@@ -1242,6 +1313,41 @@ async function waitForLink() {
   return invoke("link_status");
 }
 
+function selectTab(tab) {
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  for (const item of tabs) {
+    const on = item === tab;
+    item.setAttribute("aria-selected", on ? "true" : "false");
+    item.tabIndex = on ? 0 : -1;
+    const panel = document.getElementById(item.getAttribute("aria-controls"));
+    if (panel) panel.hidden = !on;
+  }
+}
+
+function initTabs() {
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  for (const tab of tabs) {
+    tab.addEventListener("click", () => {
+      selectTab(tab);
+      tab.focus();
+    });
+    tab.addEventListener("keydown", (e) => {
+      const i = tabs.indexOf(tab);
+      let next = null;
+      if (e.key === "ArrowRight" || e.key === "ArrowDown") next = tabs[(i + 1) % tabs.length];
+      else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = tabs[(i - 1 + tabs.length) % tabs.length];
+      else if (e.key === "Home") next = tabs[0];
+      else if (e.key === "End") next = tabs[tabs.length - 1];
+      if (!next) return;
+      e.preventDefault();
+      selectTab(next);
+      next.focus();
+    });
+  }
+}
+
+initTabs();
+
 (async () => {
   try {
     listenForReplyResults();
@@ -1252,7 +1358,10 @@ async function waitForLink() {
     listenForOpenUrls();
     const status = await refresh();
     const link = await waitForLink();
-    const rendered = document.querySelectorAll("#tools li").length === 2 && !!document.getElementById("pair-btn");
+    const rendered = document.querySelectorAll("#tools li").length === 2
+      && !!document.getElementById("pair-btn")
+      && document.querySelectorAll('[role="tab"]').length === 5
+      && !!document.getElementById("header-name");
     await invoke("frontend_ready", {
       ok: rendered,
       detail: `window rendered; link ${link.running ? `listening on ${link.port}` : `not running (${link.error || "unknown"})`}; adb ${status.adb.found ? "found" : "missing"}${status.adb.bundled ? " (built in)" : ""}, scrcpy ${status.scrcpy.found ? "found" : "missing"}${status.scrcpy.bundled ? " (built in)" : ""}, ${status.devices.length} device(s)`,

@@ -13,10 +13,10 @@
         "label": "main",
         "title": "Seam",
         "visible": false,
-        "width": 480,
-        "height": 760,
-        "minWidth": 360,
-        "minHeight": 420
+        "width": 800,
+        "height": 600,
+        "minWidth": 640,
+        "minHeight": 480
       }
     ],
     "security": {
