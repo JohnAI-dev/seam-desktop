@@ -121,14 +121,33 @@ connection, before the first `notification` from that app. The desktop caches ic
 
 ## Media
 
-Phone → desktop, whenever the active media session changes (at most once per second):
+Phone → desktop, whenever the active media session changes (at most once per second),
+and again with the current session right after `welcome`:
 
-`{"type":"media","app":"<package>","app_name":"…","title":"…","artist":"…","album":"…","playing":true|false,"position_ms":0,"duration_ms":0,"art":"<optional base64 JPEG, at most 64 KiB>"}`
+`{"type":"media","app":"<package>","app_name":"…","title":"…","artist":"…","album":"…","playing":true|false,"position_ms":0,"duration_ms":0,"art":"<optional standard base64 JPEG, at most 64 KiB>"}`
 
-`{"type":"media_stopped"}` — nothing is playing any more.
+The desktop keeps **one** session per phone. A new `media` replaces that phone's previous
+session. `playing` is required. `app`, `app_name`, `title`, `artist`, and `album` may be
+omitted or empty. `position_ms` and `duration_ms` are non-negative integers (milliseconds);
+omitted means 0. `art` may be omitted. When present it is standard base64 (no line breaks
+required) of a JPEG, at most 64 KiB of raw bytes, beginning with the JPEG start marker.
+Art that is empty, not valid base64, not a JPEG, or larger than 64 KiB is dropped; the
+rest of the session is kept.
+
+`position_ms` is the playback position when the phone sends the frame. While `playing` is
+true the desktop moves the shown position forward from that value using its own clock, and
+does not go past `duration_ms` when `duration_ms` is greater than 0. A `duration_ms` of 0
+means the length is unknown. While `playing` is false the shown position stays at
+`position_ms` (capped at `duration_ms` when that is greater than 0). `playing: false` is
+a paused session, not "nothing playing".
+
+`{"type":"media_stopped"}` — nothing is playing any more. The desktop drops that phone's
+session. It also drops the session when the phone disconnects, so the phone sends `media`
+or `media_stopped` again after the next `welcome`.
 
 Desktop → phone: `{"type":"media_control","action":"play"|"pause"|"toggle"|"next"|"previous"|"volume_up"|"volume_down"}`.
-Unknown actions are ignored.
+Unknown actions are ignored. The desktop does not change its stored session because of a
+control; it waits for the next `media` or `media_stopped`.
 
 ## Opening links
 

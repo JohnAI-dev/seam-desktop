@@ -3,7 +3,7 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use seam_core::link::client::PhoneClient;
-use seam_core::link::protocol::{CallActionKind, CallState};
+use seam_core::link::protocol::{CallActionKind, CallState, MediaAction};
 use seam_core::link::{LinkEvent, LinkServer, Message, PairingInfo, PhoneNotification};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -1257,4 +1257,126 @@ async fn open_url_both_ways_waits_for_a_click() {
         }
     );
     assert!(seam_core::link::dispatch_open_url("phone-links", "javascript:alert(1)").is_err());
+}
+
+fn sample_media(title: &str, playing: bool, position_ms: u64, art: Option<&str>) -> Message {
+    Message::Media {
+        app: "com.spotify.music".into(),
+        app_name: "Spotify".into(),
+        title: title.into(),
+        artist: "The Weeknd".into(),
+        album: "After Hours".into(),
+        playing,
+        position_ms,
+        duration_ms: 200_000,
+        art: art.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+async fn phone_reports_media_and_receives_media_control() {
+    let (server, mut events, port) = start("media").await;
+    let info = pair(&server, port);
+    let mut phone = PhoneClient::connect(&info, "127.0.0.1", &info.key, "phone-1", "Pixel")
+        .await
+        .unwrap();
+    while !matches!(next_event(&mut events).await, LinkEvent::Connected { .. }) {}
+    assert!(server.media("phone-1").is_none());
+
+    phone
+        .send(&sample_media(
+            "Blinding Lights",
+            true,
+            12_000,
+            Some("/9j/2Q=="),
+        ))
+        .await
+        .unwrap();
+    let session = match next_event(&mut events).await {
+        LinkEvent::Media { device_id, session } => {
+            assert_eq!(device_id, "phone-1");
+            session
+        }
+        other => panic!("expected media, got {other:?}"),
+    };
+    assert_eq!(session.app, "com.spotify.music");
+    assert_eq!(session.app_name, "Spotify");
+    assert_eq!(session.title, "Blinding Lights");
+    assert_eq!(session.artist, "The Weeknd");
+    assert_eq!(session.album, "After Hours");
+    assert!(session.playing);
+    assert_eq!(session.position_ms, 12_000);
+    assert_eq!(session.duration_ms, 200_000);
+    assert_eq!(session.art, "/9j/2Q==");
+    // The desktop keeps this phone's latest session, not a history.
+    assert_eq!(server.media("phone-1").as_ref(), Some(&session));
+
+    phone
+        .send(&sample_media("Save Your Tears", false, 15_000, None))
+        .await
+        .unwrap();
+    match next_event(&mut events).await {
+        LinkEvent::Media { device_id, session } => {
+            assert_eq!(device_id, "phone-1");
+            assert_eq!(session.title, "Save Your Tears");
+            assert!(!session.playing);
+            assert_eq!(session.position_ms, 15_000);
+            assert!(session.art.is_empty());
+            assert_eq!(server.media("phone-1").as_ref(), Some(&session));
+        }
+        other => panic!("expected replacement media, got {other:?}"),
+    }
+
+    assert!(server.send_to(
+        "phone-1",
+        Message::MediaControl {
+            action: MediaAction::Toggle,
+        }
+    ));
+    let got = next_msg(&mut phone).await;
+    assert_eq!(
+        got.to_line(),
+        r#"{"type":"media_control","action":"toggle"}"#
+    );
+    assert_eq!(
+        got,
+        Message::MediaControl {
+            action: MediaAction::Toggle,
+        }
+    );
+    // The control waits for the phone's next media frame before the session changes.
+    let kept = server
+        .media("phone-1")
+        .expect("session stays until the phone says otherwise");
+    assert_eq!(kept.title, "Save Your Tears");
+    assert!(!kept.playing);
+
+    phone.send(&Message::MediaStopped).await.unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::MediaStopped {
+            device_id: "phone-1".into(),
+        }
+    );
+    assert!(server.media("phone-1").is_none());
+
+    phone
+        .send(&sample_media("Blinding Lights", true, 1_000, None))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_event(&mut events).await,
+        LinkEvent::Media { .. }
+    ));
+    assert!(server.media("phone-1").is_some());
+
+    phone.close().await;
+    while !matches!(
+        next_event(&mut events).await,
+        LinkEvent::Disconnected { .. }
+    ) {}
+    assert!(
+        server.media("phone-1").is_none(),
+        "disconnect drops the session"
+    );
 }

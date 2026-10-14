@@ -155,3 +155,30 @@ button.link { background: transparent; color: var(--muted); padding: 4px 8px; fo
 .link-row .info { flex: 1; min-width: 0; }
 .link-row .name { font-weight: 600; overflow-wrap: anywhere; }
 .link-row .meta { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+
+.now-playing-card {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 12px 14px; margin-bottom: 8px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+}
+.now-playing-card .art,
+.now-playing-card .art-fallback {
+  width: 72px; height: 72px; border-radius: 8px; flex: none;
+  background: var(--line); object-fit: cover;
+}
+.now-playing-card .art-fallback {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-size: 22px;
+}
+.now-playing-card .body { flex: 1; min-width: 0; }
+.now-playing-card .app,
+.now-playing-card .time { color: var(--muted); font-size: 12px; }
+.now-playing-card .title { font-weight: 600; overflow-wrap: anywhere; }
+.now-playing-card .artist { overflow-wrap: anywhere; }
+.now-playing-card .time { margin-top: 4px; }
+.now-playing-card progress {
+  display: block; width: 100%; height: 8px; margin-top: 8px;
+  accent-color: var(--accent);
+}
+.now-playing-card .controls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.now-playing-card .controls button { padding: 5px 10px; font-size: 13px; }

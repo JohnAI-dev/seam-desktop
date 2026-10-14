@@ -9,7 +9,7 @@ mod wireless;
 use seam_core::{adb, scrcpy, tools, tools::Tool};
 use serde::Serialize;
 use std::time::Duration;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 /// Whether the app was started with `--self-test` (launch, render, report, exit).
@@ -101,6 +101,8 @@ fn start_pairing(phone_link: State<link::Link>) -> Result<link::PairingView, Str
 fn forget_phone(app: AppHandle, phone_link: State<link::Link>, id: String) -> Result<(), String> {
     phone_link.forget(&id)?;
     tray::refresh(&app);
+    // The now-playing card reads this so it hides without waiting for the next poll.
+    let _ = app.emit("media", ());
     Ok(())
 }
 
@@ -124,6 +126,15 @@ fn dismiss_notification(phone_link: State<link::Link>, phone: String, id: String
 #[tauri::command]
 fn set_dnd(phone_link: State<link::Link>, phone: String, on: bool) -> Result<(), String> {
     phone_link.set_dnd(&phone, on)
+}
+
+#[tauri::command]
+fn media_control(
+    phone_link: State<link::Link>,
+    phone: String,
+    action: String,
+) -> Result<(), String> {
+    phone_link.media_control(&phone, &action)
 }
 
 #[tauri::command]
@@ -317,6 +328,7 @@ pub fn run() {
             forget_phone,
             dismiss_notification,
             set_dnd,
+            media_control,
             reply_notification,
             call_action,
             ring_phone,
@@ -395,6 +407,17 @@ mod capability_tests {
         assert!(
             !caps.contains("autostart:default"),
             "the window must not call the autostart plugin directly"
+        );
+    }
+
+    #[test]
+    fn media_control_is_allowed_for_the_window() {
+        let caps = include_str!("../capabilities/default.json");
+        let perm = include_str!("../permissions/app.toml");
+        assert!(caps.contains("seam-commands"));
+        assert!(
+            perm.contains("media_control"),
+            "seam-commands must allow media_control"
         );
     }
 }
