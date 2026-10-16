@@ -451,7 +451,8 @@ impl LinkServer {
 
     /// Start pairing with a chosen one-time key.
     ///
-    /// Used by `seam-testpeer` so a test can print a pairing link it already knows.
+    /// Used by `seam-testpeer` so a test can supply a key it already knows.
+    /// The pairing link, which contains that key, is not logged.
     #[cfg(feature = "testpeer")]
     pub fn start_pairing_with_key(
         &self,

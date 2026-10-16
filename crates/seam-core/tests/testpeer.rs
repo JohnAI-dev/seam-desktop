@@ -39,6 +39,7 @@ struct Peer {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: mpsc::Receiver<String>,
+    uri_path: PathBuf,
 }
 
 impl Drop for Peer {
@@ -51,19 +52,35 @@ impl Drop for Peer {
 fn write_key_file(dir: &Path, contents: &str) -> PathBuf {
     let path = dir.join("pairing-key");
     std::fs::create_dir_all(dir).expect("key directory");
-    std::fs::write(&path, contents).expect("write key file");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).expect("create key file");
+    file.write_all(contents.as_bytes()).expect("write key file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("key mode");
+    }
     path
 }
 
 impl Peer {
     fn start(port: u16, key: &[u8; 32], cert_dir: &Path) -> Self {
         let key_path = write_key_file(cert_dir, &URL_SAFE_NO_PAD.encode(key));
+        let uri_path = cert_dir.join("pairing.uri");
         let mut child = Command::new(peer_bin())
             .args([
                 "--port",
                 &port.to_string(),
                 "--key-file",
                 &key_path.display().to_string(),
+                "--uri-file",
+                &uri_path.display().to_string(),
                 "--cert-dir",
                 &cert_dir.display().to_string(),
             ])
@@ -96,6 +113,7 @@ impl Peer {
             child,
             stdin: Some(stdin),
             lines: rx,
+            uri_path,
         }
     }
 
@@ -105,16 +123,50 @@ impl Peer {
             .unwrap_or_else(|_| panic!("timed out after {timeout:?} waiting for seam-testpeer"))
     }
 
+    /// The pairing link is read from the 0600 file, never from stdout.
     fn pairing_link(&self) -> PairingInfo {
-        let line = self.read_line(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let line = loop {
+            if let Ok(text) = std::fs::read_to_string(&self.uri_path) {
+                if let Some(line) = text.lines().next() {
+                    if !line.is_empty() {
+                        break line.to_string();
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the pairing link file"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(
             line.starts_with("seam://pair?"),
-            "first stdout line should be the pairing link, got {line}"
+            "uri file should hold the pairing link, got {line}"
         );
         assert!(
             line.contains("host=10.0.2.2"),
             "pairing link should use the emulator host, got {line}"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&self.uri_path)
+                .expect("uri metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "pairing link file must be 0600, got {mode:o}"
+            );
+        }
+        while let Ok(stdout_line) = self.lines.try_recv() {
+            assert!(
+                !stdout_line.contains("key="),
+                "stdout must not include the pairing key, got {stdout_line}"
+            );
+        }
         PairingInfo::parse(&line).expect("pairing link should parse")
     }
 
@@ -204,12 +256,15 @@ fn same_cert_dir_keeps_the_fingerprint() {
 fn bad_key_exits_nonzero_without_a_pairing_link() {
     let dir = temp_dir("bad");
     let key_path = write_key_file(&dir, "not-a-key");
+    let uri_path = dir.join("pairing.uri");
     let mut child = Command::new(peer_bin())
         .args([
             "--port",
             "9",
             "--key-file",
             &key_path.display().to_string(),
+            "--uri-file",
+            &uri_path.display().to_string(),
             "--cert-dir",
             &dir.display().to_string(),
         ])
@@ -231,8 +286,12 @@ fn bad_key_exits_nonzero_without_a_pairing_link() {
         .read_to_string(&mut stdout)
         .expect("read stdout");
     assert!(
-        !stdout.contains("seam://pair"),
+        !stdout.contains("seam://pair") && !stdout.contains("key="),
         "startup failure must not print a pairing link, got {stdout}"
+    );
+    assert!(
+        !uri_path.exists(),
+        "startup failure must not write a pairing link"
     );
     let mut stderr = String::new();
     child

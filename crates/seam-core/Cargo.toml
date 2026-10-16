@@ -6,9 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# On for `cargo test` of this crate, so seam-testpeer and its integration test run.
-# The desktop app turns default features off and does not ship this API.
-default = ["testpeer"]
+# Test-only desktop peer. Not a default feature: the desktop app does not ship it.
+# scripts/test.sh and CI pass `--features testpeer` explicitly.
 testpeer = []
 
 [[bin]]

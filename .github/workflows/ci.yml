@@ -26,7 +26,9 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
-      - name: Test (format, lint, unit tests, build, launch app)
+      - name: Test (format, lint, unit tests, testpeer feature, build, launch app)
+        # seam-core's testpeer feature is not a default. scripts/test.sh passes
+        # `--features testpeer` for clippy and `cargo test -p seam-core`.
         run: bash scripts/test.sh
       - name: Commit Cargo.lock if it changed
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
