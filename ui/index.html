@@ -56,7 +56,11 @@
     <section id="panel-calls" role="tabpanel" aria-labelledby="tab-calls" hidden>
       <h2>Calls</h2>
       <p id="calls-summary" class="hint">No incoming call. A ringing call stays at the top of the window, with Decline and Silence.</p>
-      <h2>Media</h2>
+      <section id="now-playing-section" aria-labelledby="now-playing-h" hidden>
+        <h2 id="now-playing-h">Now playing</h2>
+        <div id="now-playing"></div>
+        <p id="now-playing-error" class="error" role="status" hidden></p>
+      </section>
       <p id="media-empty" class="hint">Nothing is playing on the phone.</p>
     </section>
 

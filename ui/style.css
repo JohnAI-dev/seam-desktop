@@ -38,6 +38,8 @@ h1 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
   background: var(--card); color: var(--fg); border-color: var(--line);
 }
 main { flex: 1 1 auto; min-height: 0; overflow: auto; }
+/* Now playing lives in the calls tab. Hide the empty line while that section is showing. */
+#panel-calls #now-playing-section:not([hidden]) ~ #media-empty { display: none !important; }
 h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 16px 0 8px; }
 h2:first-child { margin-top: 0; }
 ul { list-style: none; margin: 0; padding: 0; }
