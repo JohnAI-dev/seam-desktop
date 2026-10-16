@@ -300,9 +300,12 @@ pub fn run() {
                     eprintln!("Seam: tray icon unavailable: {e}");
                 }
                 updates::start(app.handle());
-                if tray::wants_hidden_start(std::env::args()) {
-                    tray::hide_window(app.handle());
-                }
+            }
+            // Created hidden (`visible: false`). Show it unless this is a login start.
+            if tray::wants_hidden_start(std::env::args()) {
+                tray::hide_window(app.handle());
+            } else {
+                tray::show_window(app.handle());
             }
             Ok(())
         })

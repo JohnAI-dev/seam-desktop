@@ -12,6 +12,7 @@
       {
         "label": "main",
         "title": "Seam",
+        "visible": false,
         "width": 480,
         "height": 760,
         "minWidth": 360,

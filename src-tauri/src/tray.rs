@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Wry};
+use unicode_segmentation::UnicodeSegmentation;
 
 const TRAY_ID: &str = "seam";
 /// Tray menus are short. Longer phone names are cut and marked with an ellipsis.
@@ -54,13 +55,15 @@ pub fn phone_menu_label(name: &str, connected: bool, battery: Option<(u8, bool)>
 }
 
 /// Keep the phone name short enough for a menu row.
+///
+/// The limit is grapheme clusters, so a combining character or emoji is not split.
 fn cap_phone_name(name: &str) -> String {
     let name = name.trim();
-    let mut chars = name.chars();
-    let mut capped: String = chars.by_ref().take(MAX_PHONE_NAME_CHARS).collect();
-    if chars.next().is_some() {
+    let mut graphemes = name.graphemes(true);
+    let mut capped: String = graphemes.by_ref().take(MAX_PHONE_NAME_CHARS).collect();
+    if graphemes.next().is_some() {
         capped = name
-            .chars()
+            .graphemes(true)
             .take(MAX_PHONE_NAME_CHARS.saturating_sub(1))
             .collect();
         capped.push('…');
@@ -258,7 +261,7 @@ fn replace_phone_items(
     Ok(())
 }
 
-fn show_window(app: &AppHandle) {
+pub fn show_window(app: &AppHandle) {
     // Regular before show, so macOS puts the Dock icon back and the window can take focus.
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
@@ -325,12 +328,35 @@ mod tests {
 
     #[test]
     fn menu_label_caps_a_long_phone_name() {
+        use unicode_segmentation::UnicodeSegmentation;
         let name = "Pixel ".repeat(20);
         let label = phone_menu_label(&name, true, Some((50, false)));
         let shown = label.split(" — ").next().expect("name");
-        assert_eq!(shown.chars().count(), super::MAX_PHONE_NAME_CHARS);
+        assert_eq!(shown.graphemes(true).count(), super::MAX_PHONE_NAME_CHARS);
         assert!(shown.ends_with('…'));
         assert!(label.ends_with("Connected · 50%"));
+    }
+
+    #[test]
+    fn menu_label_caps_on_grapheme_boundaries() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let unit = "e\u{0301}";
+        assert!(unit.chars().count() > 1);
+        assert_eq!(unit.graphemes(true).count(), 1);
+
+        let kept = unit.repeat(super::MAX_PHONE_NAME_CHARS);
+        let label = phone_menu_label(&kept, true, None);
+        let shown = label.split(" — ").next().expect("name");
+        assert_eq!(shown, kept);
+
+        let cut = unit.repeat(super::MAX_PHONE_NAME_CHARS + 1);
+        let label = phone_menu_label(&cut, true, None);
+        let shown = label.split(" — ").next().expect("name");
+        assert_eq!(
+            shown,
+            format!("{}…", unit.repeat(super::MAX_PHONE_NAME_CHARS - 1))
+        );
+        assert_eq!(shown.graphemes(true).count(), super::MAX_PHONE_NAME_CHARS);
     }
 
     #[test]
