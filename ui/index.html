@@ -8,9 +8,15 @@
   <link rel="stylesheet" href="photos.css">
 </head>
 <body>
-  <header>
-    <h1>Seam</h1>
-    <p class="tagline">Your phone and your computer, as one.</p>
+  <header class="top">
+    <div class="brand">
+      <h1>Seam</h1>
+      <p class="tagline">Your phone and your computer, as one.</p>
+    </div>
+    <div id="phone-header" class="phone-header">
+      <div id="header-name" class="header-name">No phone paired</div>
+      <div id="header-meta" class="header-meta">Not connected</div>
+    </div>
   </header>
 
   <div id="call" class="call-banner" role="status" hidden>
@@ -26,49 +32,49 @@
 
   <div id="update" class="update" role="status" hidden>
     <span id="update-text"></span>
-    <button id="update-btn">Restart</button>
+    <button id="update-btn" type="button">Restart</button>
   </div>
 
+  <p id="link-confirm" class="confirm" role="status" hidden></p>
+  <p id="link-error" class="error" hidden></p>
+
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button id="tab-notifications" type="button" role="tab" aria-selected="true" aria-controls="panel-notifications" tabindex="0">Notifications</button>
+    <button id="tab-calls" type="button" role="tab" aria-selected="false" aria-controls="panel-calls" tabindex="-1">Calls &amp; media</button>
+    <button id="tab-files" type="button" role="tab" aria-selected="false" aria-controls="panel-files" tabindex="-1">Files &amp; photos</button>
+    <button id="tab-phone" type="button" role="tab" aria-selected="false" aria-controls="panel-phone" tabindex="-1">Phone</button>
+    <button id="tab-settings" type="button" role="tab" aria-selected="false" aria-controls="panel-settings" tabindex="-1">Settings</button>
+  </nav>
+
   <main>
-    <section aria-labelledby="app-h">
-      <div class="section-head">
-        <h2 id="app-h">Phone app</h2>
-        <button id="pair-btn" class="secondary">Pair phone</button>
-      </div>
-      <div id="pairing" class="pairing" hidden>
-        <div id="qr" class="qr" aria-label="Pairing QR code"></div>
-        <p>Open the camera on your phone and scan this code. It opens the Seam app and pairs it with this computer.</p>
-        <p class="hint">The code works once and expires in <span id="pair-expiry">10</span> minutes. No USB debugging needed.</p>
-        <button id="pair-done" class="secondary">Done</button>
-      </div>
-      <ul id="linked" aria-live="polite"></ul>
-      <p id="link-confirm" class="confirm" role="status" hidden></p>
-      <p id="linked-empty" class="hint">No phone paired yet. Install the Seam app on your phone, then press <strong>Pair phone</strong>.</p>
-      <p id="link-error" class="error" hidden></p>
-    </section>
-
-    <section id="photos-section" aria-labelledby="photos-h" hidden>
-      <h2 id="photos-h">Recent photos</h2>
-      <div id="photos" class="photo-strip" aria-live="polite"></div>
-      <p id="photos-status" class="hint" role="status" hidden></p>
-      <p class="hint">Click a photo to save it and show it in Finder or Explorer.</p>
-    </section>
-
-    <section aria-labelledby="notif-h">
+    <section id="panel-notifications" role="tabpanel" aria-labelledby="tab-notifications">
       <h2 id="notif-h">Phone notifications</h2>
       <ul id="notifications" class="notifications" aria-live="polite"></ul>
       <p id="notif-empty" class="hint">Notifications from your phone show up here and on your desktop.</p>
     </section>
 
-    <section id="links-section" aria-labelledby="links-h" hidden>
-      <h2 id="links-h">Links</h2>
-      <ul id="links" class="links" aria-live="polite"></ul>
-      <p class="hint">A link from your phone opens in the browser only when you click it.</p>
+    <section id="panel-calls" role="tabpanel" aria-labelledby="tab-calls" hidden>
+      <h2>Calls</h2>
+      <p id="calls-summary" class="hint">No incoming call. A ringing call stays at the top of the window, with Decline and Silence.</p>
+      <section id="now-playing-section" aria-labelledby="now-playing-h" hidden>
+        <h2 id="now-playing-h">Now playing</h2>
+        <div id="now-playing"></div>
+        <p id="now-playing-error" class="error" role="status" hidden></p>
+      </section>
+      <p id="media-empty" class="hint">Nothing is playing on the phone.</p>
     </section>
 
-    <section aria-labelledby="files-h">
+    <section id="panel-files" role="tabpanel" aria-labelledby="tab-files" hidden>
+      <section id="photos-section" aria-labelledby="photos-h" hidden>
+        <h2 id="photos-h">Recent photos</h2>
+        <div id="photos" class="photo-strip" aria-live="polite"></div>
+        <p id="photos-status" class="hint" role="status" hidden></p>
+        <p class="hint">Click a photo to save it and show it in Finder or Explorer.</p>
+      </section>
+
       <h2 id="files-h">Files</h2>
       <p class="hint">Drop a file on this window to send it to a connected phone.</p>
+      <ul id="send-files" aria-live="polite"></ul>
       <div id="drop-ask" class="drop-ask" hidden>
         <p id="drop-ask-text">Send this file to which phone?</p>
         <div id="drop-ask-phones" class="drop-ask-phones"></div>
@@ -81,45 +87,78 @@
       <p id="received-empty" class="hint">Files your phone sends show up here.</p>
     </section>
 
-    <section aria-labelledby="wireless-h">
-      <div class="section-head">
-        <h2 id="wireless-h">Mirror without cable</h2>
-        <button id="wireless-btn" class="secondary" type="button">Pair with QR code</button>
-      </div>
-      <p class="hint">Android 11 or newer, on the same Wi-Fi as this computer. No USB cable.</p>
-      <ol id="wireless-steps" class="steps">
-        <li>Enable <strong>Developer options</strong> once (Settings → About phone → tap Build number seven times).</li>
-        <li>Open <strong>Wireless debugging</strong>.</li>
-        <li>Tap <strong>Pair device with QR code</strong> and scan the code.</li>
-      </ol>
-      <div id="wireless" class="pairing" hidden>
-        <div id="wireless-qr" class="qr" aria-label="Wireless debugging QR code"></div>
-        <p id="wireless-status" class="hint">Waiting for the phone to scan the QR code...</p>
-        <p class="hint">The code expires in <span id="wireless-expiry">2</span> minutes.</p>
-        <button id="wireless-cancel" class="secondary" type="button">Cancel</button>
-      </div>
-      <p id="wireless-confirm" class="confirm" role="status" hidden></p>
-      <p id="wireless-error" class="error" hidden></p>
+    <section id="panel-phone" role="tabpanel" aria-labelledby="tab-phone" hidden>
+      <h2>Find, silence, and links</h2>
+      <ul id="phone-actions" aria-live="polite"></ul>
+      <p id="phone-actions-empty" class="hint">Pair a phone in Settings to ring it, silence it, or send a link.</p>
+
+      <section id="links-section" aria-labelledby="links-h" hidden>
+        <h2 id="links-h">Links</h2>
+        <ul id="links" class="links" aria-live="polite"></ul>
+        <p class="hint">A link from your phone opens in the browser only when you click it.</p>
+      </section>
+
+      <section aria-labelledby="wireless-h">
+        <div class="section-head">
+          <h2 id="wireless-h">Mirror without cable</h2>
+          <button id="wireless-btn" class="secondary" type="button">Pair with QR code</button>
+        </div>
+        <p class="hint">Android 11 or newer, on the same Wi-Fi as this computer. No USB cable.</p>
+        <ol id="wireless-steps" class="steps">
+          <li>Enable <strong>Developer options</strong> once (Settings → About phone → tap Build number seven times).</li>
+          <li>Open <strong>Wireless debugging</strong>.</li>
+          <li>Tap <strong>Pair device with QR code</strong> and scan the code.</li>
+        </ol>
+        <div id="wireless" class="pairing" hidden>
+          <div id="wireless-qr" class="qr" aria-label="Wireless debugging QR code"></div>
+          <p id="wireless-status" class="hint">Waiting for the phone to scan the QR code...</p>
+          <p class="hint">The code expires in <span id="wireless-expiry">2</span> minutes.</p>
+          <button id="wireless-cancel" class="secondary" type="button">Cancel</button>
+        </div>
+        <p id="wireless-confirm" class="confirm" role="status" hidden></p>
+        <p id="wireless-error" class="error" hidden></p>
+      </section>
+
+      <section aria-labelledby="phones-h">
+        <h2 id="phones-h">USB / debugging connection</h2>
+        <ul id="devices" aria-live="polite"></ul>
+        <p id="empty" class="hint" hidden>
+          No phone found. Connect it with USB and turn on <strong>USB debugging</strong>
+          in Developer options, then accept the prompt on the phone.
+        </p>
+        <p id="error" class="error" hidden></p>
+      </section>
     </section>
 
-    <section aria-labelledby="phones-h">
-      <h2 id="phones-h">USB / debugging connection</h2>
-      <ul id="devices" aria-live="polite"></ul>
-      <p id="empty" class="hint" hidden>
-        No phone found. Connect it with USB and turn on <strong>USB debugging</strong>
-        in Developer options, then accept the prompt on the phone.
-      </p>
-      <p id="error" class="error" hidden></p>
-    </section>
+    <section id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <section aria-labelledby="app-h">
+        <div class="section-head">
+          <h2 id="app-h">Pairing</h2>
+          <button id="pair-btn" class="secondary" type="button">Pair phone</button>
+        </div>
+        <div id="pairing" class="pairing" hidden>
+          <div id="qr" class="qr" aria-label="Pairing QR code"></div>
+          <p>Open the camera on your phone and scan this code. It opens the Seam app and pairs it with this computer.</p>
+          <p class="hint">The code works once and expires in <span id="pair-expiry">10</span> minutes. No USB debugging needed.</p>
+          <button id="pair-done" class="secondary" type="button">Done</button>
+        </div>
+        <ul id="linked" aria-live="polite"></ul>
+        <p id="linked-empty" class="hint">No phone paired yet. Install the Seam app on your phone, then press <strong>Pair phone</strong>.</p>
+      </section>
 
-    <section aria-labelledby="tools-h">
-      <h2 id="tools-h">Setup</h2>
+      <h2>Start at login</h2>
       <label class="check-row" for="autostart">
         <input id="autostart" type="checkbox">
         Start at login
       </label>
       <p class="hint">Off until you turn it on. Closing the window keeps Seam running in the menu bar or system tray. Quit from that icon to exit.</p>
-      <ul id="tools" class="tools"></ul>
+
+      <section aria-labelledby="tools-h">
+        <h2 id="tools-h">Setup</h2>
+        <ul id="tools" class="tools"></ul>
+      </section>
+
+      <p id="version" class="version"></p>
     </section>
   </main>
 
