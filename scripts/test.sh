@@ -33,20 +33,31 @@ checked cargo fmt --all -- --check
 
 step "lint"
 checked cargo clippy --workspace --all-targets -- -D warnings
+# testpeer is not a default feature. Lint it explicitly.
+checked cargo clippy -p seam-core --all-targets --features testpeer -- -D warnings
+
+run_cargo_tests() {
+  local title="$1"
+  shift
+  set +e
+  test_out=$("$@" 2>&1)
+  test_code=$?
+  set -e
+  echo "$test_out"
+  if [ $test_code -ne 0 ]; then
+    echo "$test_out" | grep -E "^test .* FAILED$|panicked at|left:|right:|^thread '" | head -20 | while IFS= read -r l; do
+      echo "::error title=$title::$l"
+    done
+    exit 1
+  fi
+}
 
 step "unit tests"
-set +e
-test_out=$(cargo test --workspace 2>&1)
-test_code=$?
-set -e
-echo "$test_out"
-if [ $test_code -ne 0 ]; then
-  # Surface failing tests and their panic messages as annotations.
-  echo "$test_out" | grep -E "^test .* FAILED$|panicked at|left:|right:|^thread '" | head -20 | while IFS= read -r l; do
-    echo "::error title=Unit test failed::$l"
-  done
-  exit 1
-fi
+run_cargo_tests "Unit test failed" cargo test --workspace
+
+step "testpeer feature"
+# The desktop peer is behind `--features testpeer` (not a default feature).
+run_cargo_tests "Test peer failed" cargo test -p seam-core --all-targets --features testpeer
 
 step "build app"
 cargo build -p seam-desktop

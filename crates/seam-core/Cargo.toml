@@ -5,6 +5,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test-only desktop peer. Not a default feature: the desktop app does not ship it.
+# scripts/test.sh and CI pass `--features testpeer` explicitly.
+testpeer = []
+
+[[bin]]
+name = "seam-testpeer"
+path = "src/bin/seam-testpeer.rs"
+required-features = ["testpeer"]
+
+[[test]]
+name = "testpeer"
+path = "tests/testpeer.rs"
+required-features = ["testpeer"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -171,6 +171,9 @@ struct Inner {
     open_urls: Mutex<Vec<IncomingLink>>,
     /// Latest media session per connected phone. Cleared on `media_stopped` and disconnect.
     media: Mutex<media::Sessions>,
+    /// When set, every message received from a phone is copied here.
+    #[cfg(feature = "testpeer")]
+    received_log: Mutex<Option<mpsc::UnboundedSender<Message>>>,
 }
 
 /// Servers still alive, so the window can list links without the UI state type.
@@ -230,6 +233,8 @@ impl LinkServer {
             unauth: Mutex::new(0),
             open_urls: Mutex::new(Vec::new()),
             media: Mutex::new(media::Sessions::default()),
+            #[cfg(feature = "testpeer")]
+            received_log: Mutex::new(None),
         };
         let inner = Arc::new(inner);
         register_live(&inner);
@@ -441,6 +446,24 @@ impl LinkServer {
     pub fn start_pairing(&self, hosts: Vec<String>, port: u16) -> PairingInfo {
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
+        self.begin_pairing(hosts, port, key)
+    }
+
+    /// Start pairing with a chosen one-time key.
+    ///
+    /// Used by `seam-testpeer` so a test can supply a key it already knows.
+    /// The pairing link, which contains that key, is not logged.
+    #[cfg(feature = "testpeer")]
+    pub fn start_pairing_with_key(
+        &self,
+        hosts: Vec<String>,
+        port: u16,
+        key: [u8; 32],
+    ) -> PairingInfo {
+        self.begin_pairing(hosts, port, key)
+    }
+
+    fn begin_pairing(&self, hosts: Vec<String>, port: u16, key: [u8; 32]) -> PairingInfo {
         *self.inner.pending.lock().unwrap() = Some(Pending {
             key,
             created: Instant::now(),
@@ -451,6 +474,22 @@ impl LinkServer {
             fingerprint: self.inner.fingerprint.clone(),
             key,
             name: self.inner.desktop_name.clone(),
+        }
+    }
+
+    /// Copy every authenticated message received from a phone to `tx`.
+    ///
+    /// The hello is not included: it carries the pairing proof and is not yet authenticated.
+    #[cfg(feature = "testpeer")]
+    pub fn log_received_messages(&self, tx: mpsc::UnboundedSender<Message>) {
+        *self.inner.received_log.lock().unwrap() = Some(tx);
+    }
+
+    #[cfg(feature = "testpeer")]
+    fn note_received(&self, msg: &Message) {
+        let log = self.inner.received_log.lock().unwrap();
+        if let Some(tx) = log.as_ref() {
+            let _ = tx.send(msg.clone());
         }
     }
 
@@ -882,7 +921,11 @@ impl LinkServer {
                         // Malformed media frames are dropped in the reader, before this.
                         // Any other bad frame still ends the link.
                         Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-                        Some(Ok(m)) => m,
+                        Some(Ok(m)) => {
+                            #[cfg(feature = "testpeer")]
+                            self.note_received(&m);
+                            m
+                        }
                     };
                     // A forgotten phone is disconnected on its next message.
                     if self.inner.store.device(device_id).is_none() {

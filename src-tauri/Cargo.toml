@@ -13,7 +13,7 @@ name = "seam_desktop_lib"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-seam-core = { path = "../crates/seam-core" }
+seam-core = { path = "../crates/seam-core", default-features = false }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-notification = "2"
 tauri-plugin-dialog = "2"

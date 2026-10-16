@@ -5,4 +5,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo fmt --all
 cargo clippy --workspace --all-targets --fix --allow-dirty --allow-no-vcs --quiet -- -D warnings >/dev/null 2>&1 || true
+cargo clippy -p seam-core --all-targets --features testpeer --fix --allow-dirty --allow-no-vcs --quiet -- -D warnings >/dev/null 2>&1 || true
 cargo fmt --all
