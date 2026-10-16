@@ -37,6 +37,8 @@ button:disabled { opacity: 0.45; cursor: default; }
 .tools .ok { color: var(--ok); }
 .tools .missing { color: var(--warn); }
 .hint { color: var(--muted); }
+.check-row { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; cursor: pointer; }
+.check-row input { width: 16px; height: 16px; margin: 0; }
 .error { color: var(--bad); }
 .confirm { color: var(--ok); }
 

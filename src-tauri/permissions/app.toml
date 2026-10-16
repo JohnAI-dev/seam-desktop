@@ -30,4 +30,6 @@ commands.allow = [
   "send_open_url",
   "open_link",
   "frontend_ready",
+  "autostart_enabled",
+  "set_autostart",
 ]

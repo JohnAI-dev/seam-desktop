@@ -543,6 +543,15 @@ fn ring_message(action: &str) -> Result<Message, &'static str> {
     }
 }
 
+/// One paired phone, as the menu bar / tray menu shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhoneSummary {
+    pub name: String,
+    pub connected: bool,
+    /// Battery percent and whether it is charging, when the phone has reported one.
+    pub battery: Option<(u8, bool)>,
+}
+
 /// App state for the link. `server` is `None` if it could not start.
 pub struct Link {
     server: Option<LinkServer>,
@@ -550,6 +559,21 @@ pub struct Link {
 }
 
 impl Link {
+    /// Paired phones for the tray menu, sorted by name.
+    pub fn phone_summaries(&self) -> Vec<PhoneSummary> {
+        let s = self.shared.lock().unwrap();
+        let mut phones: Vec<_> = s.phones.values().cloned().collect();
+        phones.sort_by(|a, b| a.name.cmp(&b.name));
+        phones
+            .into_iter()
+            .map(|phone| PhoneSummary {
+                name: phone.name,
+                connected: phone.connected,
+                battery: phone.battery,
+            })
+            .collect()
+    }
+
     pub fn status(&self) -> LinkStatus {
         let s = self.shared.lock().unwrap();
         let mut phones: Vec<_> = s.phones.values().cloned().collect();
@@ -1359,6 +1383,7 @@ fn handle_event(
     event: LinkEvent,
 ) {
     let mut show: Option<PhoneNotification> = None;
+    let mut phones_changed = false;
     let mut reply_push: Option<ReplyResultPush> = None;
     let mut notify_caller: Option<String> = None;
     let mut call_changed = false;
@@ -1380,6 +1405,7 @@ fn handle_event(
                 });
                 phone.name = name;
                 phone.connected = true;
+                phones_changed = true;
             }
             LinkEvent::Disconnected { device_id } => {
                 let dropped_photo = s
@@ -1390,6 +1416,7 @@ fn handle_event(
                 if dropped_photo {
                     photos_changed = true;
                 }
+                phones_changed = true;
             }
             LinkEvent::Battery {
                 device_id,
@@ -1398,6 +1425,7 @@ fn handle_event(
             } => {
                 if let Some(p) = s.phones.get_mut(&device_id) {
                     p.battery = Some((level, charging));
+                    phones_changed = true;
                 }
             }
             LinkEvent::Dnd { device_id, on } => {
@@ -1567,6 +1595,9 @@ fn handle_event(
     }
     if dnd_changed {
         let _ = app.emit("dnd", ());
+    }
+    if phones_changed {
+        crate::tray::refresh(app);
     }
     if let Some(path) = reveal_photo {
         // Finder/Explorer can be slow. Do not block the link event loop on it.

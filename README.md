@@ -16,6 +16,18 @@ Your phone and your computer, as one. One codebase for Linux, Mac and Windows, b
 
 On Linux (incl. Arch) run the `.AppImage` from the latest release; on Mac open the `.dmg`.
 
+## Start at login
+
+The tray menu and Settings can turn on Start at login. It stays off until then. The login
+entry starts Seam with `--hidden`, so the window stays closed and Seam remains in the menu bar.
+
+Uninstalling Seam does not remove that entry, and Quit does not turn it off. Turn Start at
+login off to delete it. Otherwise it is left behind:
+
+- Linux: `~/.config/autostart/Seam.desktop`
+- macOS: `~/Library/LaunchAgents/Seam.plist`
+- Windows: the `Seam` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+
 ## How it gets built (autonomous)
 
 1. **Open an issue** (as the repo owner) describing a bug or feature.

@@ -1162,9 +1162,38 @@ async function refreshLink() {
   return link;
 }
 
+async function refreshAutostart() {
+  const box = document.getElementById("autostart");
+  if (!box || box.dataset.busy === "1") return;
+  try {
+    const on = await invoke("autostart_enabled");
+    if (box.dataset.busy === "1") return;
+    box.checked = !!on;
+  } catch (e) {
+    // The window still renders if start-at-login cannot be read.
+  }
+}
+
+const autostartBox = document.getElementById("autostart");
+if (autostartBox) {
+  autostartBox.addEventListener("change", async () => {
+    autostartBox.dataset.busy = "1";
+    try {
+      await invoke("set_autostart", { enabled: autostartBox.checked });
+      showError(null);
+    } catch (e) {
+      autostartBox.checked = !autostartBox.checked;
+      showError(String(e));
+    } finally {
+      autostartBox.dataset.busy = "0";
+    }
+  });
+}
+
 async function refresh() {
   refreshLink().catch((e) => showLinkError(String(e)));
   refreshOpenLinks().catch(() => {});
+  refreshAutostart().catch(() => {});
   await refreshWireless().catch((e) => showWirelessError(String(e)));
   const status = await invoke("status");
   renderDevices(status);

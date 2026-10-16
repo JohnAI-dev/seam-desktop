@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/seam-core", "src-tauri"]
+members = ["crates/seam-core", "crates/auto-launch", "src-tauri"]
+
+[patch.crates-io]
+auto-launch = { path = "crates/auto-launch" }
 
 [workspace.package]
 version = "0.1.0"
