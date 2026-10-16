@@ -260,6 +260,18 @@ pub enum Message {
     Unknown,
 }
 
+/// One line from the other side, after media frames that do not parse are set aside.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboundLine {
+    /// A frame this build understands, or an unknown type to ignore.
+    Frame(Message),
+    /// `media`, `media_stopped`, or `media_control` that is not valid for its type.
+    ///
+    /// The string is that frame's type and nothing else. The connection stays up and the
+    /// previous session is left unchanged.
+    IgnoredMedia(&'static str),
+}
+
 impl Message {
     /// Encode as one line (without the trailing newline).
     pub fn to_line(&self) -> String {
@@ -269,6 +281,34 @@ impl Message {
     /// Decode one line.
     pub fn from_line(line: &str) -> Result<Self, String> {
         serde_json::from_str(line.trim()).map_err(|e| format!("bad message: {e}"))
+    }
+}
+
+/// Parse one line. A malformed media frame is [`InboundLine::IgnoredMedia`], not an error.
+///
+/// Any other line that does not parse is an error. The caller ends the connection on that.
+pub fn parse_inbound_line(line: &str) -> Result<InboundLine, String> {
+    match Message::from_line(line) {
+        Ok(message) => Ok(InboundLine::Frame(message)),
+        Err(reason) => match media_frame_kind(line) {
+            Some(kind) => Ok(InboundLine::IgnoredMedia(kind)),
+            None => Err(reason),
+        },
+    }
+}
+
+/// The `type` of a media frame, when the line is JSON of that type.
+///
+/// Only these three static strings are returned, so a log line cannot quote the payload.
+fn media_frame_kind(line: &str) -> Option<&'static str> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return None;
+    };
+    match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("media") => Some("media"),
+        Some("media_stopped") => Some("media_stopped"),
+        Some("media_control") => Some("media_control"),
+        _ => None,
     }
 }
 
@@ -1003,6 +1043,35 @@ mod tests {
             }
         );
         assert!(Message::from_line(r#"{"type":"media","title":"x"}"#).is_err());
+        // A bad media frame is reported, not turned into a session.
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media","title":"x"}"#).unwrap(),
+            InboundLine::IgnoredMedia("media")
+        );
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media","playing":true,"position_ms":-1}"#).unwrap(),
+            InboundLine::IgnoredMedia("media")
+        );
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media_control"}"#).unwrap(),
+            InboundLine::IgnoredMedia("media_control")
+        );
+        assert!(parse_inbound_line(r#"{"type":"battery","level":"no"}"#).is_err());
+        assert!(parse_inbound_line("not json").is_err());
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media","playing":false}"#).unwrap(),
+            InboundLine::Frame(Message::Media {
+                app: String::new(),
+                app_name: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                playing: false,
+                position_ms: 0,
+                duration_ms: 0,
+                art: None,
+            })
+        );
 
         assert_eq!(
             Message::MediaStopped.to_line(),

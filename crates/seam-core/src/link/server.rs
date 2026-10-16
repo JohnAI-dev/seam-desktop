@@ -879,6 +879,8 @@ impl LinkServer {
                 frame = frames.recv() => {
                     let msg = match frame {
                         None => return Ok(()),
+                        // Malformed media frames are dropped in the reader, before this.
+                        // Any other bad frame still ends the link.
                         Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                         Some(Ok(m)) => m,
                     };
@@ -1387,7 +1389,17 @@ pub(crate) fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
             if line.trim().is_empty() {
                 continue;
             }
-            if tx.send(Message::from_line(&line)).await.is_err() {
+            let parsed = match protocol::parse_inbound_line(&line) {
+                Ok(protocol::InboundLine::Frame(message)) => Ok(message),
+                Ok(protocol::InboundLine::IgnoredMedia(kind)) => {
+                    // Keep the connection and the previous session. See PROTOCOL.md, Media.
+                    // The parse error can quote values from the frame, so log only the type.
+                    eprintln!("Seam link: ignoring malformed {kind} frame");
+                    continue;
+                }
+                Err(reason) => Err(reason),
+            };
+            if tx.send(parsed).await.is_err() {
                 return;
             }
         }

@@ -1351,6 +1351,31 @@ async fn phone_reports_media_and_receives_media_control() {
     assert_eq!(kept.title, "Save Your Tears");
     assert!(!kept.playing);
 
+    phone
+        .send_raw(r#"{"type":"media","playing":true,"position_ms":-1}"#)
+        .await
+        .unwrap();
+    phone
+        .send(&Message::Battery {
+            level: 42,
+            charging: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events).await,
+        LinkEvent::Battery {
+            device_id: "phone-1".into(),
+            level: 42,
+            charging: false,
+        }
+    );
+    assert_eq!(
+        server.media("phone-1").as_ref(),
+        Some(&kept),
+        "a malformed media frame is ignored and the session stays"
+    );
+
     phone.send(&Message::MediaStopped).await.unwrap();
     assert_eq!(
         next_event(&mut events).await,

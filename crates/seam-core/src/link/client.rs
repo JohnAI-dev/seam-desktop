@@ -151,7 +151,12 @@ impl PhoneClient {
     }
 
     pub async fn send(&mut self, msg: &Message) -> io::Result<()> {
-        let mut line = msg.to_line();
+        self.send_raw(&msg.to_line()).await
+    }
+
+    /// Write one raw frame. Used to send a line that is not a valid message.
+    pub async fn send_raw(&mut self, line: &str) -> io::Result<()> {
+        let mut line = line.trim().to_string();
         line.push('\n');
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.flush().await

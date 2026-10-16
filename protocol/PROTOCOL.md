@@ -119,6 +119,7 @@ Phone → desktop: `{"type":"app_icon","app":"<package name>","png":"<standard b
 square PNG of the app's icon, at most 96×96 px and 16 KiB. The phone sends it once per app per
 connection, before the first `notification` from that app. The desktop caches icons by `app`.
 
+<!-- MEDIA-SECTION-START -->
 ## Media
 
 Phone → desktop, whenever the active media session changes (at most once per second),
@@ -148,6 +149,13 @@ or `media_stopped` again after the next `welcome`.
 Desktop → phone: `{"type":"media_control","action":"play"|"pause"|"toggle"|"next"|"previous"|"volume_up"|"volume_down"}`.
 Unknown actions are ignored. The desktop does not change its stored session because of a
 control; it waits for the next `media` or `media_stopped`.
+
+A `media`, `media_stopped`, or `media_control` frame that is JSON but not valid for its
+type (for example `playing` missing, `position_ms` negative or not an integer, or
+`media_control` with no action string) is ignored. The receiver logs it and keeps the
+connection. A bad `media` frame does not replace or clear the previous session. Any other
+malformed frame still ends the connection.
+<!-- MEDIA-SECTION-END -->
 
 ## Opening links
 
