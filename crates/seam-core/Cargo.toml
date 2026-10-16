@@ -5,6 +5,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# On for `cargo test` of this crate, so seam-testpeer and its integration test run.
+# The desktop app turns default features off and does not ship this API.
+default = ["testpeer"]
+testpeer = []
+
+[[bin]]
+name = "seam-testpeer"
+path = "src/bin/seam-testpeer.rs"
+required-features = ["testpeer"]
+
+[[test]]
+name = "testpeer"
+path = "tests/testpeer.rs"
+required-features = ["testpeer"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

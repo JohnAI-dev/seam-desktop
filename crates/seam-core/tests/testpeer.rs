@@ -48,14 +48,22 @@ impl Drop for Peer {
     }
 }
 
+fn write_key_file(dir: &Path, contents: &str) -> PathBuf {
+    let path = dir.join("pairing-key");
+    std::fs::create_dir_all(dir).expect("key directory");
+    std::fs::write(&path, contents).expect("write key file");
+    path
+}
+
 impl Peer {
     fn start(port: u16, key: &[u8; 32], cert_dir: &Path) -> Self {
+        let key_path = write_key_file(cert_dir, &URL_SAFE_NO_PAD.encode(key));
         let mut child = Command::new(peer_bin())
             .args([
                 "--port",
                 &port.to_string(),
-                "--key",
-                &URL_SAFE_NO_PAD.encode(key),
+                "--key-file",
+                &key_path.display().to_string(),
                 "--cert-dir",
                 &cert_dir.display().to_string(),
             ])
@@ -194,14 +202,16 @@ fn same_cert_dir_keeps_the_fingerprint() {
 
 #[test]
 fn bad_key_exits_nonzero_without_a_pairing_link() {
+    let dir = temp_dir("bad");
+    let key_path = write_key_file(&dir, "not-a-key");
     let mut child = Command::new(peer_bin())
         .args([
             "--port",
             "9",
-            "--key",
-            "not-a-key",
+            "--key-file",
+            &key_path.display().to_string(),
             "--cert-dir",
-            &temp_dir("bad").display().to_string(),
+            &dir.display().to_string(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
