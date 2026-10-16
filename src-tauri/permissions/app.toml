@@ -11,6 +11,7 @@ commands.allow = [
   "forget_phone",
   "dismiss_notification",
   "set_dnd",
+  "media_control",
   "reply_notification",
   "call_action",
   "ring_phone",

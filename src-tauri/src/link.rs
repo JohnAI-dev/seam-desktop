@@ -4,6 +4,10 @@
 //! Do Not Disturb (`dnd` from the phone) is shown next to the phone. While it is
 //! on, system popups for that phone's notifications are suppressed; they are still
 //! listed. "Silence phone" sends `dnd_set`.
+//!
+//! Now playing (`media` from the phone) is one card per connected phone. The card
+//! hides on `media_stopped` or when the phone disconnects. Transport and volume
+//! buttons send `media_control`.
 
 use seam_core::link::transfer::sanitize_name;
 use seam_core::link::{self, photos, LinkEvent, LinkServer, Message, PhoneNotification};
@@ -84,6 +88,28 @@ pub struct CallView {
     number: String,
     name: String,
     caller: String,
+}
+
+/// One phone's now-playing card.
+///
+/// `art` is a `data:image/jpeg;base64,...` URL, or empty when the phone sent none.
+/// `updated_ms` is when this snapshot arrived. While `playing` is true the window
+/// advances the bar from `position_ms` using that timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MediaView {
+    phone: String,
+    phone_name: String,
+    app: String,
+    app_name: String,
+    title: String,
+    artist: String,
+    album: String,
+    playing: bool,
+    position_ms: u64,
+    duration_ms: u64,
+    art: String,
+    /// Unix milliseconds when the desktop received this snapshot.
+    updated_ms: i64,
 }
 
 /// One recent photo in the thumbnail strip.
@@ -170,6 +196,8 @@ pub struct LinkStatus {
     received: Vec<ReceivedFileView>,
     /// Recent photos, newest first, at most 12 per phone.
     photos: Vec<PhotoView>,
+    /// Now playing, one card per connected phone that has a session.
+    media: Vec<MediaView>,
 }
 
 #[derive(Serialize)]
@@ -208,6 +236,8 @@ struct Shared {
     /// `(phone, id, saves)` of photos whose file was saved this session.
     /// `saves` increases each time the file arrives, so a repeat click is not already done.
     saved_photos: Vec<(String, String, u32)>,
+    /// Latest media session per phone. Empty art means there is nothing to show.
+    media: HashMap<String, link::media::MediaSession>,
     /// Last time a send-progress refresh was pushed to the window.
     last_transfer_emit: Option<Instant>,
 }
@@ -304,7 +334,21 @@ impl Shared {
         }
         let call_changed = self.clear_call(device_id);
         self.drop_unmatched_photo_requests(device_id);
+        self.clear_media(device_id);
         call_changed
+    }
+
+    /// Replace this phone's now-playing session.
+    fn note_media(&mut self, phone: &str, session: link::media::MediaSession) {
+        if phone.is_empty() {
+            return;
+        }
+        self.media.insert(phone.to_string(), session);
+    }
+
+    /// Drop this phone's now-playing session. False when it had none.
+    fn clear_media(&mut self, phone: &str) -> bool {
+        self.media.remove(phone).is_some()
     }
 
     /// Record this phone's Do Not Disturb flag. A phone not listed yet is added so
@@ -589,6 +633,7 @@ impl Link {
             sends: s.sends.iter().cloned().collect(),
             received: s.received.iter().cloned().collect(),
             photos: photo_views(&s.photos, &s.saved_photos, &s.pending_photos),
+            media: media_views(&s),
         }
     }
 
@@ -624,7 +669,26 @@ impl Link {
         s.notifications.retain(|n| n.phone != id);
         s.clear_call(id);
         s.clear_photos(id);
+        s.clear_media(id);
         Ok(())
+    }
+
+    /// Send `media_control` to a connected phone.
+    ///
+    /// `action` is `play`, `pause`, `toggle`, `next`, `previous`, `volume_up`, or
+    /// `volume_down`. The stored session stays until the phone sends `media` or
+    /// `media_stopped`.
+    pub fn media_control(&self, phone: &str, action: &str) -> Result<(), String> {
+        let msg = link::media::control_message(action).map_err(str::to_string)?;
+        let server = self
+            .server
+            .as_ref()
+            .ok_or("the phone link is not running")?;
+        if server.send_to(phone, msg) {
+            Ok(())
+        } else {
+            Err("this phone is not connected".into())
+        }
     }
 
     /// Ask a connected phone to send a photo it announced. The file comes back
@@ -1022,6 +1086,34 @@ fn photo_saved_notice(name: &str, phone: &str) -> String {
     format!("Saved {name} from {phone}")
 }
 
+fn media_views(shared: &Shared) -> Vec<MediaView> {
+    let mut views = Vec::new();
+    for (id, session) in &shared.media {
+        let Some(phone) = shared.phones.get(id) else {
+            continue;
+        };
+        if !phone.connected {
+            continue;
+        }
+        views.push(MediaView {
+            phone: id.clone(),
+            phone_name: phone.name.clone(),
+            app: session.app.clone(),
+            app_name: session.app_name.clone(),
+            title: session.title.clone(),
+            artist: session.artist.clone(),
+            album: session.album.clone(),
+            playing: session.playing,
+            position_ms: session.position_ms,
+            duration_ms: session.duration_ms,
+            art: link::media::art_data_url(&session.art),
+            updated_ms: session.updated_ms,
+        });
+    }
+    views.sort_by(|a, b| a.phone_name.cmp(&b.phone_name).then(a.phone.cmp(&b.phone)));
+    views
+}
+
 fn photo_views(
     photos: &[photos::RecentPhoto],
     saved: &[(String, String, u32)],
@@ -1391,6 +1483,7 @@ fn handle_event(
     let mut transfer_changed = false;
     let mut photos_changed = false;
     let mut dnd_changed = false;
+    let mut media_changed = false;
     let mut reveal_photo: Option<PathBuf> = None;
     {
         let mut s = shared.lock().unwrap();
@@ -1412,9 +1505,13 @@ fn handle_event(
                     .pending_photos
                     .iter()
                     .any(|photo| photo.phone == device_id);
+                let had_media = s.media.contains_key(&device_id);
                 call_changed = s.apply_disconnect(&device_id);
                 if dropped_photo {
                     photos_changed = true;
+                }
+                if had_media {
+                    media_changed = true;
                 }
                 phones_changed = true;
             }
@@ -1431,6 +1528,14 @@ fn handle_event(
             LinkEvent::Dnd { device_id, on } => {
                 s.set_dnd_state(&device_id, on);
                 dnd_changed = true;
+            }
+            LinkEvent::Media { device_id, session } => {
+                s.note_media(&device_id, session);
+                media_changed = true;
+            }
+            LinkEvent::MediaStopped { device_id } => {
+                s.clear_media(&device_id);
+                media_changed = true;
             }
             LinkEvent::Notification {
                 device_id,
@@ -1595,6 +1700,9 @@ fn handle_event(
     }
     if dnd_changed {
         let _ = app.emit("dnd", ());
+    }
+    if media_changed {
+        let _ = app.emit("media", ());
     }
     if phones_changed {
         crate::tray::refresh(app);
@@ -2969,6 +3077,128 @@ mod tests {
             Message::DndSet { on: true }.to_line(),
             r#"{"type":"dnd_set","on":true}"#,
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn media_session(title: &str, art: Option<&str>) -> seam_core::link::media::MediaSession {
+        seam_core::link::media::MediaSession::from_frame(
+            seam_core::link::media::MediaFrame {
+                app: "com.spotify.music".into(),
+                app_name: "Spotify".into(),
+                title: title.into(),
+                artist: "The Weeknd".into(),
+                album: "After Hours".into(),
+                playing: true,
+                position_ms: 12_000,
+                duration_ms: 200_000,
+                art: art.map(str::to_string),
+            },
+            1_700_000_000_000,
+        )
+    }
+
+    #[test]
+    fn link_status_lists_now_playing_only_for_connected_phones() {
+        let link = link_with(vec![
+            phone_view("phone-a", "Pixel", true),
+            phone_view("phone-b", "Galaxy", false),
+        ]);
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.note_media(
+                "phone-a",
+                media_session("Blinding Lights", Some("/9j/2Q==")),
+            );
+            shared.note_media("phone-b", media_session("Hidden", Some("/9j/2Q==")));
+            shared.note_media("phone-c", media_session("Unknown", None));
+        }
+        let media = serde_json::to_value(link.status()).unwrap()["media"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0]["phone"], "phone-a");
+        assert_eq!(media[0]["phone_name"], "Pixel");
+        assert_eq!(media[0]["app"], "com.spotify.music");
+        assert_eq!(media[0]["app_name"], "Spotify");
+        assert_eq!(media[0]["title"], "Blinding Lights");
+        assert_eq!(media[0]["artist"], "The Weeknd");
+        assert_eq!(media[0]["album"], "After Hours");
+        assert_eq!(media[0]["playing"], true);
+        assert_eq!(media[0]["position_ms"], 12_000);
+        assert_eq!(media[0]["duration_ms"], 200_000);
+        assert_eq!(media[0]["art"], "data:image/jpeg;base64,/9j/2Q==");
+        assert_eq!(media[0]["updated_ms"], 1_700_000_000_000_i64);
+
+        {
+            let mut shared = link.shared.lock().unwrap();
+            let _ = shared.apply_disconnect("phone-a");
+            assert!(!shared.media.contains_key("phone-a"));
+        }
+        assert!(serde_json::to_value(link.status()).unwrap()["media"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.phones.get_mut("phone-a").unwrap().connected = true;
+            shared.note_media("phone-a", media_session("Again", None));
+            assert!(shared.clear_media("phone-a"));
+            assert!(!shared.clear_media("phone-a"));
+        }
+        assert!(serde_json::to_value(link.status()).unwrap()["media"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn media_control_needs_a_known_action_and_a_connection() {
+        let offline = Link {
+            server: None,
+            shared: Arc::new(Mutex::new(Shared::default())),
+        };
+        assert_eq!(
+            offline.media_control("phone-a", "toggle").unwrap_err(),
+            "the phone link is not running"
+        );
+
+        let dir = std::env::temp_dir().join(format!("seam-media-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (server, _events) = LinkServer::new(&dir, "Test Desktop".into()).unwrap();
+        let link = Link {
+            server: Some(server),
+            shared: Arc::new(Mutex::new(Shared {
+                phones: HashMap::from([("phone-a".into(), phone_view("phone-a", "Pixel", true))]),
+                ..Shared::default()
+            })),
+        };
+        {
+            let mut shared = link.shared.lock().unwrap();
+            shared.note_media("phone-a", media_session("Blinding Lights", None));
+            shared.note_media("phone-b", media_session("Other", None));
+        }
+        assert_eq!(
+            link.media_control("phone-a", "seek").unwrap_err(),
+            "unknown media action"
+        );
+        assert_eq!(
+            link.media_control("phone-a", "toggle").unwrap_err(),
+            "this phone is not connected"
+        );
+        assert_eq!(
+            Message::MediaControl {
+                action: seam_core::link::protocol::MediaAction::Toggle,
+            }
+            .to_line(),
+            r#"{"type":"media_control","action":"toggle"}"#
+        );
+        link.forget("phone-a").unwrap();
+        let shared = link.shared.lock().unwrap();
+        assert!(!shared.media.contains_key("phone-a"));
+        assert_eq!(shared.media.get("phone-b").unwrap().title, "Other");
+        drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -61,6 +61,24 @@ pub enum CallActionKind {
     Unknown,
 }
 
+/// What the computer asks the phone to do with the active media session.
+///
+/// Unknown actions are ignored by the phone, and must not fail the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAction {
+    Play,
+    Pause,
+    Toggle,
+    Next,
+    Previous,
+    VolumeUp,
+    VolumeDown,
+    /// An action this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Who to show for a call: the contact name, otherwise the number, otherwise "Unknown caller".
 ///
 /// Blank and whitespace-only fields are treated as missing.
@@ -206,11 +224,52 @@ pub enum Message {
     DndSet {
         on: bool,
     },
+    /// Phone → desktop: the active media session. Replaces that phone's previous one.
+    Media {
+        #[serde(default)]
+        app: String,
+        #[serde(default)]
+        app_name: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        artist: String,
+        #[serde(default)]
+        album: String,
+        playing: bool,
+        /// Playback position when the phone sent the frame, in milliseconds.
+        #[serde(default)]
+        position_ms: u64,
+        /// Track length in milliseconds. `0` means unknown.
+        #[serde(default)]
+        duration_ms: u64,
+        /// Standard base64 JPEG, at most 64 KiB of raw bytes. Omitted when there is none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        art: Option<String>,
+    },
+    /// Phone → desktop: nothing is playing. The desktop drops that phone's session.
+    MediaStopped,
+    /// Desktop → phone: transport or volume. Unknown actions are ignored by the phone.
+    MediaControl {
+        action: MediaAction,
+    },
     Ping,
     Pong,
     /// Any message type this build doesn't know. Ignored, so newer phones still work.
     #[serde(other)]
     Unknown,
+}
+
+/// One line from the other side, after media frames that do not parse are set aside.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InboundLine {
+    /// A frame this build understands, or an unknown type to ignore.
+    Frame(Message),
+    /// `media`, `media_stopped`, or `media_control` that is not valid for its type.
+    ///
+    /// The string is that frame's type and nothing else. The connection stays up and the
+    /// previous session is left unchanged.
+    IgnoredMedia(&'static str),
 }
 
 impl Message {
@@ -222,6 +281,34 @@ impl Message {
     /// Decode one line.
     pub fn from_line(line: &str) -> Result<Self, String> {
         serde_json::from_str(line.trim()).map_err(|e| format!("bad message: {e}"))
+    }
+}
+
+/// Parse one line. A malformed media frame is [`InboundLine::IgnoredMedia`], not an error.
+///
+/// Any other line that does not parse is an error. The caller ends the connection on that.
+pub fn parse_inbound_line(line: &str) -> Result<InboundLine, String> {
+    match Message::from_line(line) {
+        Ok(message) => Ok(InboundLine::Frame(message)),
+        Err(reason) => match media_frame_kind(line) {
+            Some(kind) => Ok(InboundLine::IgnoredMedia(kind)),
+            None => Err(reason),
+        },
+    }
+}
+
+/// The `type` of a media frame, when the line is JSON of that type.
+///
+/// Only these three static strings are returned, so a log line cannot quote the payload.
+fn media_frame_kind(line: &str) -> Option<&'static str> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return None;
+    };
+    match value.get("type").and_then(|kind| kind.as_str()) {
+        Some("media") => Some("media"),
+        Some("media_stopped") => Some("media_stopped"),
+        Some("media_control") => Some("media_control"),
+        _ => None,
     }
 }
 
@@ -902,5 +989,121 @@ mod tests {
         );
         assert!(Message::from_line(r#"{"type":"dnd"}"#).is_err());
         assert!(Message::from_line(r#"{"type":"dnd_set"}"#).is_err());
+    }
+
+    #[test]
+    fn media_media_stopped_and_media_control_round_trip() {
+        let playing = Message::Media {
+            app: "com.spotify.music".into(),
+            app_name: "Spotify".into(),
+            title: "Blinding Lights".into(),
+            artist: "The Weeknd".into(),
+            album: "After Hours".into(),
+            playing: true,
+            position_ms: 12_000,
+            duration_ms: 200_000,
+            art: Some("/9j/2Q==".into()),
+        };
+        assert_eq!(
+            playing.to_line(),
+            r#"{"type":"media","app":"com.spotify.music","app_name":"Spotify","title":"Blinding Lights","artist":"The Weeknd","album":"After Hours","playing":true,"position_ms":12000,"duration_ms":200000,"art":"/9j/2Q=="}"#,
+        );
+        assert_eq!(Message::from_line(&playing.to_line()).unwrap(), playing);
+
+        let paused = Message::Media {
+            app: String::new(),
+            app_name: "Spotify".into(),
+            title: "Song".into(),
+            artist: String::new(),
+            album: String::new(),
+            playing: false,
+            position_ms: 0,
+            duration_ms: 0,
+            art: None,
+        };
+        assert_eq!(
+            paused.to_line(),
+            r#"{"type":"media","app":"","app_name":"Spotify","title":"Song","artist":"","album":"","playing":false,"position_ms":0,"duration_ms":0}"#,
+        );
+        assert_eq!(Message::from_line(&paused.to_line()).unwrap(), paused);
+
+        // Optional fields default so a short frame does not drop the connection.
+        assert_eq!(
+            Message::from_line(r#"{"type":"media","playing":true}"#).unwrap(),
+            Message::Media {
+                app: String::new(),
+                app_name: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                playing: true,
+                position_ms: 0,
+                duration_ms: 0,
+                art: None,
+            }
+        );
+        assert!(Message::from_line(r#"{"type":"media","title":"x"}"#).is_err());
+        // A bad media frame is reported, not turned into a session.
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media","title":"x"}"#).unwrap(),
+            InboundLine::IgnoredMedia("media")
+        );
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media","playing":true,"position_ms":-1}"#).unwrap(),
+            InboundLine::IgnoredMedia("media")
+        );
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media_control"}"#).unwrap(),
+            InboundLine::IgnoredMedia("media_control")
+        );
+        assert!(parse_inbound_line(r#"{"type":"battery","level":"no"}"#).is_err());
+        assert!(parse_inbound_line("not json").is_err());
+        assert_eq!(
+            parse_inbound_line(r#"{"type":"media","playing":false}"#).unwrap(),
+            InboundLine::Frame(Message::Media {
+                app: String::new(),
+                app_name: String::new(),
+                title: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                playing: false,
+                position_ms: 0,
+                duration_ms: 0,
+                art: None,
+            })
+        );
+
+        assert_eq!(
+            Message::MediaStopped.to_line(),
+            r#"{"type":"media_stopped"}"#
+        );
+        assert_eq!(
+            Message::from_line(r#"{"type":"media_stopped"}"#).unwrap(),
+            Message::MediaStopped
+        );
+
+        for (name, action) in [
+            ("play", MediaAction::Play),
+            ("pause", MediaAction::Pause),
+            ("toggle", MediaAction::Toggle),
+            ("next", MediaAction::Next),
+            ("previous", MediaAction::Previous),
+            ("volume_up", MediaAction::VolumeUp),
+            ("volume_down", MediaAction::VolumeDown),
+        ] {
+            let msg = Message::MediaControl { action };
+            assert_eq!(
+                msg.to_line(),
+                format!(r#"{{"type":"media_control","action":"{name}"}}"#)
+            );
+            assert_eq!(Message::from_line(&msg.to_line()).unwrap(), msg);
+        }
+        assert_eq!(
+            Message::from_line(r#"{"type":"media_control","action":"seek"}"#).unwrap(),
+            Message::MediaControl {
+                action: MediaAction::Unknown,
+            }
+        );
+        assert!(Message::from_line(r#"{"type":"media_control"}"#).is_err());
     }
 }

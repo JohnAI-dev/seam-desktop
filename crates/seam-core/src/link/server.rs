@@ -2,6 +2,7 @@
 //! sends are streamed into the download folder. Files sent to a phone are read
 //! from disk and written one chunk at a time so the connection stays responsive.
 
+use super::media::{self, MediaSession};
 use super::open_url::{self, IncomingLink};
 use super::protocol::{self, Message, PairingInfo, PhoneNotification, MAX_FRAME};
 use super::store::{PairedDevice, Store};
@@ -73,6 +74,15 @@ pub enum LinkEvent {
     Dnd {
         device_id: String,
         on: bool,
+    },
+    /// Phone reported the active media session. Replaces that phone's previous one.
+    Media {
+        device_id: String,
+        session: MediaSession,
+    },
+    /// Nothing is playing on this phone any more.
+    MediaStopped {
+        device_id: String,
     },
     Clipboard {
         device_id: String,
@@ -159,6 +169,8 @@ struct Inner {
     unauth: Mutex<usize>,
     /// http(s) links a phone asked us to open. Newest first. Never opened here.
     open_urls: Mutex<Vec<IncomingLink>>,
+    /// Latest media session per connected phone. Cleared on `media_stopped` and disconnect.
+    media: Mutex<media::Sessions>,
 }
 
 /// Servers still alive, so the window can list links without the UI state type.
@@ -217,6 +229,7 @@ impl LinkServer {
             download_dir,
             unauth: Mutex::new(0),
             open_urls: Mutex::new(Vec::new()),
+            media: Mutex::new(media::Sessions::default()),
         };
         let inner = Arc::new(inner);
         register_live(&inner);
@@ -401,6 +414,13 @@ impl LinkServer {
         }
     }
 
+    /// Latest media session for a phone, if one is playing or paused.
+    ///
+    /// `None` after `media_stopped` or after the phone disconnects.
+    pub fn media(&self, device_id: &str) -> Option<MediaSession> {
+        self.inner.media.lock().unwrap().get(device_id).cloned()
+    }
+
     /// Ids of the phones connected right now.
     pub fn connected(&self) -> Vec<String> {
         self.inner
@@ -413,6 +433,7 @@ impl LinkServer {
     }
 
     pub fn forget(&self, device_id: &str) -> io::Result<bool> {
+        self.inner.media.lock().unwrap().stop(device_id);
         self.inner.store.remove(device_id)
     }
 
@@ -585,6 +606,8 @@ impl LinkServer {
         self.inner.file_outs.lock().unwrap().remove(&device_id);
         drop(file_out);
         self.fail_outbound(&device_id);
+        // The phone sends the current session again after the next welcome.
+        self.inner.media.lock().unwrap().stop(&device_id);
         let _ = self
             .inner
             .events
@@ -856,6 +879,8 @@ impl LinkServer {
                 frame = frames.recv() => {
                     let msg = match frame {
                         None => return Ok(()),
+                        // Malformed media frames are dropped in the reader, before this.
+                        // Any other bad frame still ends the link.
                         Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                         Some(Ok(m)) => m,
                     };
@@ -903,6 +928,44 @@ impl LinkServer {
                             device_id: id,
                             on,
                         }),
+                        Message::Media {
+                            app,
+                            app_name,
+                            title,
+                            artist,
+                            album,
+                            playing,
+                            position_ms,
+                            duration_ms,
+                            art,
+                        } => self
+                            .inner
+                            .media
+                            .lock()
+                            .unwrap()
+                            .remember(
+                                device_id,
+                                media::MediaFrame {
+                                    app,
+                                    app_name,
+                                    title,
+                                    artist,
+                                    album,
+                                    playing,
+                                    position_ms,
+                                    duration_ms,
+                                    art,
+                                },
+                                media::now_ms(),
+                            )
+                            .map(|session| LinkEvent::Media {
+                                device_id: id,
+                                session,
+                            }),
+                        Message::MediaStopped => {
+                            self.inner.media.lock().unwrap().stop(device_id);
+                            Some(LinkEvent::MediaStopped { device_id: id })
+                        }
                         Message::OpenUrl { url } => {
                             self.note_open_url(device_id, &url);
                             None
@@ -1326,7 +1389,17 @@ pub(crate) fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
             if line.trim().is_empty() {
                 continue;
             }
-            if tx.send(Message::from_line(&line)).await.is_err() {
+            let parsed = match protocol::parse_inbound_line(&line) {
+                Ok(protocol::InboundLine::Frame(message)) => Ok(message),
+                Ok(protocol::InboundLine::IgnoredMedia(kind)) => {
+                    // Keep the connection and the previous session. See PROTOCOL.md, Media.
+                    // The parse error can quote values from the frame, so log only the type.
+                    eprintln!("Seam link: ignoring malformed {kind} frame");
+                    continue;
+                }
+                Err(reason) => Err(reason),
+            };
+            if tx.send(parsed).await.is_err() {
                 return;
             }
         }

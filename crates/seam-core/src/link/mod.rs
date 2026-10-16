@@ -7,6 +7,7 @@
 pub mod client;
 pub mod dnd;
 pub mod mdns;
+pub mod media;
 pub mod open_url;
 pub mod photos;
 pub mod protocol;
