@@ -13,6 +13,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, Wry};
 
 const TRAY_ID: &str = "seam";
+/// Tray menus are short. Longer phone names are cut and marked with an ellipsis.
+const MAX_PHONE_NAME_CHARS: usize = 40;
 
 /// Set when Quit is chosen, so the window close that follows is allowed to exit.
 pub struct RunFlags {
@@ -35,7 +37,7 @@ struct TrayUi {
 
 /// Text for one phone in the tray menu. `&` is escaped because menus treat it as a mnemonic.
 pub fn phone_menu_label(name: &str, connected: bool, battery: Option<(u8, bool)>) -> String {
-    let name = name.trim().replace('&', "&&");
+    let name = cap_phone_name(name).replace('&', "&&");
     let name = if name.is_empty() {
         "Phone".to_string()
     } else {
@@ -49,6 +51,31 @@ pub fn phone_menu_label(name: &str, connected: bool, battery: Option<(u8, bool)>
         Some((level, false)) => format!("{name} — Connected · {level}%"),
         None => format!("{name} — Connected"),
     }
+}
+
+/// Keep the phone name short enough for a menu row.
+fn cap_phone_name(name: &str) -> String {
+    let name = name.trim();
+    let mut chars = name.chars();
+    let mut capped: String = chars.by_ref().take(MAX_PHONE_NAME_CHARS).collect();
+    if chars.next().is_some() {
+        capped = name
+            .chars()
+            .take(MAX_PHONE_NAME_CHARS.saturating_sub(1))
+            .collect();
+        capped.push('…');
+    }
+    capped
+}
+
+/// Closing the window hides it, except during the headless self-test and after Quit.
+pub fn close_should_hide(self_test: bool, quitting: bool) -> bool {
+    !self_test && !quitting
+}
+
+/// `--hidden` is passed by the login entry so a start at login does not open the window.
+pub fn wants_hidden_start(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    args.into_iter().any(|arg| arg.as_ref() == "--hidden")
 }
 
 /// Hide instead of quitting, except during self-test and after Quit.
@@ -66,7 +93,7 @@ pub fn install_window_behavior(app: &AppHandle) {
             let quitting = app
                 .try_state::<RunFlags>()
                 .is_some_and(|flags| flags.quitting.load(Ordering::SeqCst));
-            if self_test || quitting {
+            if !close_should_hide(self_test, quitting) {
                 return;
             }
             api.prevent_close();
@@ -134,6 +161,13 @@ pub fn autostart_enabled(app: &AppHandle) -> bool {
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
+/// Turn the operating system login entry on or off.
+///
+/// Uninstalling the app does not remove that entry: this plugin has no uninstall
+/// hook. Turning start-at-login off deletes it. The entry is
+/// `~/.config/autostart/Seam.desktop` on Linux,
+/// `~/Library/LaunchAgents/Seam.plist` on macOS, and the `Seam` value under
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` on Windows.
 pub fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     set_os_autostart(app, enabled)?;
     if let Some(ui) = app.try_state::<TrayUi>() {
@@ -235,7 +269,7 @@ fn show_window(app: &AppHandle) {
     }
 }
 
-fn hide_window(app: &AppHandle) {
+pub fn hide_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
@@ -287,5 +321,57 @@ mod tests {
         );
         assert_eq!(phone_menu_label("  ", true, None), "Phone — Connected");
         assert_eq!(phone_menu_label("A & B", true, None), "A && B — Connected");
+    }
+
+    #[test]
+    fn menu_label_caps_a_long_phone_name() {
+        let name = "Pixel ".repeat(20);
+        let label = phone_menu_label(&name, true, Some((50, false)));
+        let shown = label.split(" — ").next().expect("name");
+        assert_eq!(shown.chars().count(), super::MAX_PHONE_NAME_CHARS);
+        assert!(shown.ends_with('…'));
+        assert!(label.ends_with("Connected · 50%"));
+    }
+
+    #[test]
+    fn close_hides_the_window_until_quit_or_self_test() {
+        assert!(super::close_should_hide(false, false));
+        assert!(!super::close_should_hide(true, false));
+        assert!(!super::close_should_hide(false, true));
+        assert!(!super::close_should_hide(true, true));
+    }
+
+    #[test]
+    fn hidden_argument_starts_without_a_window() {
+        assert!(super::wants_hidden_start(["seam-desktop", "--hidden"]));
+        assert!(!super::wants_hidden_start(["seam-desktop"]));
+        assert!(!super::wants_hidden_start(["seam-desktop", "--self-test"]));
+    }
+
+    #[test]
+    fn tray_labels_follow_connection_and_battery() {
+        let phones = [
+            crate::link::PhoneSummary {
+                name: "Pixel".into(),
+                connected: true,
+                battery: Some((82, true)),
+            },
+            crate::link::PhoneSummary {
+                name: "Other".into(),
+                connected: false,
+                battery: Some((10, false)),
+            },
+        ];
+        let labels: Vec<String> = phones
+            .iter()
+            .map(|phone| phone_menu_label(&phone.name, phone.connected, phone.battery))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Pixel — Connected · 82% ⚡".to_string(),
+                "Other — Not connected".to_string(),
+            ]
+        );
     }
 }

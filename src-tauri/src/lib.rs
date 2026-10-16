@@ -280,7 +280,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // The login entry must not open the window. `--hidden` is read in setup.
+            Some(vec!["--hidden"]),
         ))
         .manage(updates::Updates::default())
         .manage(SelfTest(self_test))
@@ -299,6 +300,9 @@ pub fn run() {
                     eprintln!("Seam: tray icon unavailable: {e}");
                 }
                 updates::start(app.handle());
+                if tray::wants_hidden_start(std::env::args()) {
+                    tray::hide_window(app.handle());
+                }
             }
             Ok(())
         })
@@ -384,6 +388,10 @@ mod capability_tests {
         assert!(
             perm.contains("set_autostart"),
             "seam-commands must allow set_autostart"
+        );
+        assert!(
+            !caps.contains("autostart:default"),
+            "the window must not call the autostart plugin directly"
         );
     }
 }
