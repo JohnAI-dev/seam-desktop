@@ -6,6 +6,9 @@ on:
   push:
     branches: [main]
     paths-ignore: ['.github/**', '**.md', 'Cargo.lock']
+  # Lets a pull request run the same matrix without publishing. Removed after
+  # the Windows NSIS job is shown green; push and workflow_call are unchanged.
+  pull_request:
   workflow_call:
     outputs:
       url:
@@ -25,9 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          # Push and workflow_call release main. A manual run builds the
-          # selected commit so a branch can be checked before it is merged.
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || 'main' }}
+          # Push and workflow_call release main. A pull request builds its head
+          # commit. A manual run builds the selected commit.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'workflow_dispatch' && github.sha || 'main' }}
           fetch-depth: 0
       - id: v
         # Version = 0.1.<number of commits>, so every release is newer than the last.
@@ -133,9 +136,9 @@ jobs:
   publish:
     needs: [plan, build]
     # Publish whatever platforms built, even if one of them failed.
-    # A manual run from any branch other than main is a build check: it must
-    # not create a tag or a GitHub release.
-    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+    # A pull request, and a manual run from any branch other than main, is a
+    # build check: it must not create a tag or a GitHub release.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.rel.outputs.url }}
