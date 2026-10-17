@@ -25,7 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: main
+          # Push and workflow_call release main. A manual run builds the
+          # selected commit so a branch can be checked before it is merged.
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || 'main' }}
           fetch-depth: 0
       - id: v
         # Version = 0.1.<number of commits>, so every release is newer than the last.
@@ -131,7 +133,9 @@ jobs:
   publish:
     needs: [plan, build]
     # Publish whatever platforms built, even if one of them failed.
-    if: ${{ !cancelled() }}
+    # A manual run from any branch other than main is a build check: it must
+    # not create a tag or a GitHub release.
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.rel.outputs.url }}

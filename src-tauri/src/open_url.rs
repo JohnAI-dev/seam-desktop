@@ -97,9 +97,11 @@ fn action_notification_id(payload: &str) -> Option<i32> {
 }
 
 fn confirm_notification(app: &AppHandle, title: String, host: String, url: String) {
-    // Prefer a platform notification whose activation we can observe everywhere.
-    // notify-rust covers Linux (and macOS/Windows when the crate supports them)
-    // without blocking the caller: the watcher is capped and detached.
+    // notify-rust 4.11 implements `close` and `wait_for_action` only on XDG
+    // (Linux). On macOS, `show` returns a handle without those methods. On
+    // Windows, `show` returns `()`. Both of those builds use the Tauri
+    // notification plugin, whose click listener opens the link.
+    #[cfg(all(unix, not(target_os = "macos")))]
     if show_actionable(app, &title, &host, url.clone()) {
         return;
     }
@@ -109,6 +111,10 @@ fn confirm_notification(app: &AppHandle, title: String, host: String, url: Strin
 /// Show via notify-rust and watch for the default action on a capped thread.
 /// Returns false when the notification could not be shown, so the caller can
 /// fall back to the Tauri plugin (which also has a click handler).
+///
+/// Same cfg as notify-rust 4.11's XDG `NotificationHandle`. Calling `close` or
+/// `wait_for_action` on the macOS or Windows return type does not compile.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn show_actionable(app: &AppHandle, title: &str, host: &str, url: String) -> bool {
     let mut note = notify_rust::Notification::new();
     note.summary(title)
@@ -174,11 +180,13 @@ fn show_plugin_notification(app: &AppHandle, title: String, host: String, url: S
     });
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn watcher_count() -> &'static Mutex<usize> {
     static COUNT: OnceLock<Mutex<usize>> = OnceLock::new();
     COUNT.get_or_init(|| Mutex::new(0))
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn reserve_watcher() -> bool {
     let mut n = watcher_count().lock().unwrap();
     if *n >= MAX_WATCHERS {
@@ -188,8 +196,10 @@ fn reserve_watcher() -> bool {
     true
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 struct WatcherGuard;
 
+#[cfg(all(unix, not(target_os = "macos")))]
 impl Drop for WatcherGuard {
     fn drop(&mut self) {
         let mut n = watcher_count().lock().unwrap();
@@ -210,6 +220,7 @@ mod tests {
         assert_eq!(action_notification_id("{}"), None);
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn watcher_cap_stops_a_flood() {
         *watcher_count().lock().unwrap() = 0;
