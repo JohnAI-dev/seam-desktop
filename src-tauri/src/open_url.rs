@@ -1,7 +1,8 @@
 //! Confirm-before-open for links a phone sends, and sending links back.
 //!
-//! A received `open_url` is never opened here by itself. The person clicks the
-//! system notification or the matching row in the Links list.
+//! A received `open_url` is never opened here by itself. On Linux, notify-rust
+//! opens it when the person clicks the notification. On Windows and macOS a
+//! click does nothing; the Links list is the only way in.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -40,7 +41,7 @@ pub fn install(app: &AppHandle) {
     });
 }
 
-/// Open a stored link. Called only from the Links list (or a notification click).
+/// Open a stored link. Called only from the Links list.
 #[tauri::command]
 pub fn open_link(id: String) -> Result<(), String> {
     let link = seam_core::link::lookup_incoming_link(&id)?;
@@ -66,12 +67,14 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     open::that_detached(&target).map_err(|e| format!("could not open the link: {e}"))
 }
 
-/// Register the plugin's action listener once. A click looks up the URL that
-/// was stored for that notification id and opens it. Dismissal does nothing.
+/// Listen for `plugin:notification://action-performed`.
+///
+/// tauri-plugin-notification 2.4.0 never sends `action-performed` on desktop.
+/// On Windows and macOS a click does nothing. The Links list is the only way in.
 fn install_click_handler(app: &AppHandle) {
     let app = app.clone();
-    // `on_action` is the cross-platform click path (Linux, macOS, Windows).
-    // It is invoked only when the person activates the notification.
+    // This is not a cross-platform click path. The desktop plugin does not emit
+    // the event, so the closure never runs on Linux, macOS, or Windows.
     let _ = app.listen("plugin:notification://action-performed", move |event| {
         let id = action_notification_id(event.payload());
         let Some(id) = id else {
@@ -97,9 +100,11 @@ fn action_notification_id(payload: &str) -> Option<i32> {
 }
 
 fn confirm_notification(app: &AppHandle, title: String, host: String, url: String) {
-    // Prefer a platform notification whose activation we can observe everywhere.
-    // notify-rust covers Linux (and macOS/Windows when the crate supports them)
-    // without blocking the caller: the watcher is capped and detached.
+    // Linux opens the link from notify-rust's `wait_for_action`. macOS and
+    // Windows stay on the plugin notification: `close` does not compile on
+    // those handles. A click there does nothing. The Links list is the only
+    // way in.
+    #[cfg(all(unix, not(target_os = "macos")))]
     if show_actionable(app, &title, &host, url.clone()) {
         return;
     }
@@ -107,8 +112,13 @@ fn confirm_notification(app: &AppHandle, title: String, host: String, url: Strin
 }
 
 /// Show via notify-rust and watch for the default action on a capped thread.
-/// Returns false when the notification could not be shown, so the caller can
-/// fall back to the Tauri plugin (which also has a click handler).
+/// Returns false when the notification could not be shown. The caller then
+/// shows a plugin notification, which never reports a click on desktop, so
+/// the Links list is how that link gets opened.
+///
+/// Linux only: `all(unix, not(target_os = "macos"))`. `close` does not compile
+/// on the macOS or Windows handle.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn show_actionable(app: &AppHandle, title: &str, host: &str, url: String) -> bool {
     let mut note = notify_rust::Notification::new();
     note.summary(title)
@@ -162,8 +172,8 @@ fn show_plugin_notification(app: &AppHandle, title: String, host: String, url: S
     }
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
-        // `id` is what the action-performed event reports. The URL is opened
-        // only in that listener, never here.
+        // The id is stored with the URL. tauri-plugin-notification 2.4.0 never
+        // sends `action-performed` on desktop, so a click does not open it.
         let _ = app2
             .notification()
             .builder()
@@ -174,11 +184,13 @@ fn show_plugin_notification(app: &AppHandle, title: String, host: String, url: S
     });
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn watcher_count() -> &'static Mutex<usize> {
     static COUNT: OnceLock<Mutex<usize>> = OnceLock::new();
     COUNT.get_or_init(|| Mutex::new(0))
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 fn reserve_watcher() -> bool {
     let mut n = watcher_count().lock().unwrap();
     if *n >= MAX_WATCHERS {
@@ -188,8 +200,10 @@ fn reserve_watcher() -> bool {
     true
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 struct WatcherGuard;
 
+#[cfg(all(unix, not(target_os = "macos")))]
 impl Drop for WatcherGuard {
     fn drop(&mut self) {
         let mut n = watcher_count().lock().unwrap();
@@ -210,6 +224,7 @@ mod tests {
         assert_eq!(action_notification_id("{}"), None);
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn watcher_cap_stops_a_flood() {
         *watcher_count().lock().unwrap() = 0;
