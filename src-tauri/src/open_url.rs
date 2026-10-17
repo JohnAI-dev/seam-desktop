@@ -1,7 +1,8 @@
 //! Confirm-before-open for links a phone sends, and sending links back.
 //!
-//! A received `open_url` is never opened here by itself. The person clicks the
-//! system notification or the matching row in the Links list.
+//! A received `open_url` is never opened here by itself. On Linux, notify-rust
+//! opens it when the person clicks the notification. On Windows and macOS a
+//! click does nothing; the Links list is the only way in.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -40,7 +41,7 @@ pub fn install(app: &AppHandle) {
     });
 }
 
-/// Open a stored link. Called only from the Links list (or a notification click).
+/// Open a stored link. Called only from the Links list.
 #[tauri::command]
 pub fn open_link(id: String) -> Result<(), String> {
     let link = seam_core::link::lookup_incoming_link(&id)?;
@@ -66,12 +67,14 @@ fn open_in_browser(url: &str) -> Result<(), String> {
     open::that_detached(&target).map_err(|e| format!("could not open the link: {e}"))
 }
 
-/// Register the plugin's action listener once. A click looks up the URL that
-/// was stored for that notification id and opens it. Dismissal does nothing.
+/// Listen for `plugin:notification://action-performed`.
+///
+/// tauri-plugin-notification 2.4.0 never sends `action-performed` on desktop.
+/// On Windows and macOS a click does nothing. The Links list is the only way in.
 fn install_click_handler(app: &AppHandle) {
     let app = app.clone();
-    // `on_action` is the cross-platform click path (Linux, macOS, Windows).
-    // It is invoked only when the person activates the notification.
+    // This is not a cross-platform click path. The desktop plugin does not emit
+    // the event, so the closure never runs on Linux, macOS, or Windows.
     let _ = app.listen("plugin:notification://action-performed", move |event| {
         let id = action_notification_id(event.payload());
         let Some(id) = id else {
@@ -97,10 +100,10 @@ fn action_notification_id(payload: &str) -> Option<i32> {
 }
 
 fn confirm_notification(app: &AppHandle, title: String, host: String, url: String) {
-    // notify-rust 4.11 implements `close` and `wait_for_action` only on XDG
-    // (Linux). On macOS, `show` returns a handle without those methods. On
-    // Windows, `show` returns `()`. Both of those builds use the Tauri
-    // notification plugin, whose click listener opens the link.
+    // Linux opens the link from notify-rust's `wait_for_action`. macOS and
+    // Windows stay on the plugin notification: `close` does not compile on
+    // those handles. A click there does nothing. The Links list is the only
+    // way in.
     #[cfg(all(unix, not(target_os = "macos")))]
     if show_actionable(app, &title, &host, url.clone()) {
         return;
@@ -109,11 +112,12 @@ fn confirm_notification(app: &AppHandle, title: String, host: String, url: Strin
 }
 
 /// Show via notify-rust and watch for the default action on a capped thread.
-/// Returns false when the notification could not be shown, so the caller can
-/// fall back to the Tauri plugin (which also has a click handler).
+/// Returns false when the notification could not be shown. The caller then
+/// shows a plugin notification, which never reports a click on desktop, so
+/// the Links list is how that link gets opened.
 ///
-/// Same cfg as notify-rust 4.11's XDG `NotificationHandle`. Calling `close` or
-/// `wait_for_action` on the macOS or Windows return type does not compile.
+/// Linux only: `all(unix, not(target_os = "macos"))`. `close` does not compile
+/// on the macOS or Windows handle.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn show_actionable(app: &AppHandle, title: &str, host: &str, url: String) -> bool {
     let mut note = notify_rust::Notification::new();
@@ -168,8 +172,8 @@ fn show_plugin_notification(app: &AppHandle, title: String, host: String, url: S
     }
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
-        // `id` is what the action-performed event reports. The URL is opened
-        // only in that listener, never here.
+        // The id is stored with the URL. tauri-plugin-notification 2.4.0 never
+        // sends `action-performed` on desktop, so a click does not open it.
         let _ = app2
             .notification()
             .builder()
