@@ -6,10 +6,6 @@ on:
   push:
     branches: [main]
     paths-ignore: ['.github/**', '**.md', 'Cargo.lock']
-  # Lets a pull request run the same matrix without publishing. Removed after
-  # the Windows NSIS, macOS, and Linux jobs are shown green; push and
-  # workflow_call are unchanged.
-  pull_request:
   workflow_call:
     outputs:
       url:
@@ -29,9 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Push and workflow_call release main. A pull request builds its head
-          # commit.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'main' }}
+          ref: main
           fetch-depth: 0
       - id: v
         # Version = 0.1.<number of commits>, so every release is newer than the last.
@@ -137,8 +131,7 @@ jobs:
   publish:
     needs: [plan, build]
     # Publish whatever platforms built, even if one of them failed.
-    # A pull request is a build check: it must not create a tag or a GitHub release.
-    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.rel.outputs.url }}
