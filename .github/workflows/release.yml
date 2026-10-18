@@ -23,7 +23,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       sha: ${{ steps.v.outputs.sha }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
           fetch-depth: 0
@@ -45,7 +45,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.sha }}
       - name: Install system libraries
@@ -53,10 +53,10 @@ jobs:
         run: bash scripts/install-deps.sh
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249  # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
       - name: Fetch built-in adb and scrcpy
@@ -114,7 +114,7 @@ jobs:
             "$f" --version >/dev/null 2>&1 || "$f" version >/dev/null 2>&1 || { echo "::error::built-in $t does not run on macOS"; exit 1; }
           done
           echo "Mac app is signed and its built-in tools run"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: seam-${{ matrix.os }}
           path: |
@@ -136,11 +136,11 @@ jobs:
     outputs:
       url: ${{ steps.rel.outputs.url }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.plan.outputs.sha }}
           sparse-checkout: scripts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
