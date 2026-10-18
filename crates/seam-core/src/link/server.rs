@@ -445,7 +445,7 @@ impl LinkServer {
     /// Start pairing: create a fresh one-time key and return the QR contents.
     pub fn start_pairing(&self, hosts: Vec<String>, port: u16) -> PairingInfo {
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         self.begin_pairing(hosts, port, key)
     }
 
@@ -552,7 +552,7 @@ impl LinkServer {
         let mut pre_auth = BufReader::new(read_half);
 
         let mut nonce = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let nonce = hex::encode(nonce);
         send(
             &mut writer,
@@ -1076,7 +1076,7 @@ fn prepare_send(path: &Path) -> Result<PreparedSend, String> {
 
 fn new_transfer_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
