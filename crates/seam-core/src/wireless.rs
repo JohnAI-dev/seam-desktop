@@ -105,9 +105,9 @@ pub fn parse_pairing_qr(payload: &str) -> Option<(String, String)> {
 /// `S` is `seam-` plus 16 hex chars; `P` is 10 digits. Both are safe in the QR and as a DNS label.
 pub fn generate_pairing_credentials() -> PairingCredentials {
     let mut raw = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut raw);
+    rand::rng().fill_bytes(&mut raw);
     let service_name = format!("seam-{}", hex::encode(raw));
-    let password = format!("{:010}", rand::thread_rng().gen_range(0..10_000_000_000u64));
+    let password = format!("{:010}", rand::rng().random_range(0..10_000_000_000u64));
     PairingCredentials {
         service_name,
         password,
