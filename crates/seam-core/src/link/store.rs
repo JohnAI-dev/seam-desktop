@@ -61,7 +61,7 @@ impl Store {
             .map_err(io::Error::other)?;
         let identity = Identity {
             cert_der: generated.cert.der().to_vec(),
-            key_der: generated.key_pair.serialize_der(),
+            key_der: generated.signing_key.serialize_der(),
         };
         write_private(&key_path, &identity.key_der)?;
         fs::write(&cert_path, &identity.cert_der)?;
@@ -156,5 +156,42 @@ mod tests {
         );
         assert!(reopened.remove("phone-1").unwrap());
         assert!(Store::open(&dir).unwrap().devices().is_empty());
+    }
+
+    /// A desktop that already has `cert.der` and `key.der` must keep that identity.
+    /// Generating a new one would break every phone paired to the old certificate.
+    #[test]
+    fn existing_identity_files_load_unchanged() {
+        let dir = temp_dir("existing");
+        let cert = vec![0x30, 0x03, 0x01, 0x02, 0x03];
+        let key = vec![0x30, 0x04, 0x04, 0x05, 0x06, 0x07];
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cert.der"), &cert).unwrap();
+        fs::write(dir.join("key.der"), &key).unwrap();
+        let loaded = Store::open(&dir).unwrap().identity().unwrap();
+        assert_eq!(loaded.cert_der, cert);
+        assert_eq!(loaded.key_der, key);
+    }
+
+    /// rcgen 0.14 names the private key `signing_key`. It must still be PKCS#8,
+    /// which is the only form the link server hands to rustls.
+    #[test]
+    fn generated_identity_loads_as_pkcs8() {
+        use std::sync::Arc;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio_rustls::rustls::{self, ServerConfig};
+
+        let dir = temp_dir("pkcs8");
+        let identity = Store::open(&dir).unwrap().identity().unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(identity.cert_der)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der)),
+            )
+            .expect("generated identity is a PKCS#8 key rustls accepts");
     }
 }
