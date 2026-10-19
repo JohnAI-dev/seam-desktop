@@ -313,6 +313,127 @@ checksum = "fff"
         self.assertIn(("rand", "0.9.5"), names)
         self.assertGreater(len(rows), 400)
 
+    def test_unreadable_path_publishes_even_when_both_sides_fail(self) -> None:
+        missing = gate.TreeEntry(gate.Unreadable("cat-file failed"), "100644")
+        self.assertTrue(
+            gate.should_publish(
+                {"src/lib.rs": missing},
+                {"src/lib.rs": "fn shipped() {}\n"},
+            )
+        )
+        self.assertTrue(gate.should_publish({"docs/a.md": missing}, {"docs/a.md": missing}))
+
+    def test_mode_change_publishes_source_not_readme(self) -> None:
+        src = "fn shipped() {}\n"
+        self.assertTrue(
+            gate.should_publish(
+                {"src/lib.rs": gate.TreeEntry(src, "100644")},
+                {"src/lib.rs": gate.TreeEntry(src, "100755")},
+            )
+        )
+        self.assertFalse(
+            gate.should_publish(
+                {"README.md": gate.TreeEntry("docs\n", "100644")},
+                {"README.md": gate.TreeEntry("docs\n", "100755")},
+            )
+        )
+
+    def test_skip_is_limited_to_known_places(self) -> None:
+        self.assertFalse(
+            gate.should_publish(
+                {"crates/app/tests/link.rs": "fn a() {}\n"},
+                {"crates/app/tests/link.rs": "fn b() {}\n"},
+            )
+        )
+        self.assertFalse(
+            gate.should_publish(
+                {"crates/app/src/fixtures/sample.json": "old"},
+                {"crates/app/src/fixtures/sample.json": "new"},
+            )
+        )
+        self.assertTrue(
+            gate.should_publish(
+                {"src/tests/foo.rs": "fn a() {}\n"},
+                {"src/tests/foo.rs": "fn b() {}\n"},
+            )
+        )
+        self.assertTrue(
+            gate.should_publish(
+                {"vendor/fixtures/sample.json": "old"},
+                {"vendor/fixtures/sample.json": "new"},
+            )
+        )
+        self.assertTrue(
+            gate.should_publish(
+                {"crates/app/README.md": "old"},
+                {"crates/app/README.md": "new"},
+            )
+        )
+        self.assertFalse(
+            gate.should_publish({"README.md": "old"}, {"README.md": "new"})
+        )
+
+    def test_prod_include_is_not_skipped(self) -> None:
+        src = 'fn shipped() { let _ = include_str!("../../../docs/guide.md"); }\n'
+        before = {"crates/app/src/lib.rs": src, "docs/guide.md": "old"}
+        after = {"crates/app/src/lib.rs": src, "docs/guide.md": "new"}
+        self.assertTrue(gate.should_publish(before, after))
+        raw = 'const ICON: &[u8] = include_bytes!(r"../icons/128x128.png");\n'
+        self.assertTrue(
+            gate.should_publish(
+                {"src-tauri/src/tray.rs": raw, "src-tauri/icons/128x128.png": b"old"},
+                {"src-tauri/src/tray.rs": raw, "src-tauri/icons/128x128.png": b"new"},
+            )
+        )
+
+    def test_test_only_include_of_fixture_does_not_publish(self) -> None:
+        src = '''
+fn shipped() {}
+#[cfg(test)]
+mod tests {
+    const X: &[u8] = include_bytes!("fixtures/sample.bin");
+}
+'''
+        before = {
+            "crates/app/src/lib.rs": src,
+            "crates/app/src/fixtures/sample.bin": b"old",
+        }
+        after = {
+            "crates/app/src/lib.rs": src,
+            "crates/app/src/fixtures/sample.bin": b"new",
+        }
+        self.assertFalse(gate.should_publish(before, after))
+
+    def test_unresolved_include_publishes(self) -> None:
+        src = '''
+const X: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/guide.md"));
+'''
+        self.assertTrue(gate.should_publish({"src/lib.rs": src}, {"src/lib.rs": src}))
+        stripped = '''
+fn shipped() {}
+#[cfg(test)]
+mod tests {
+    const X: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/x"));
+}
+'''
+        self.assertFalse(
+            gate.should_publish(
+                {"src/lib.rs": stripped, "docs/guide.md": "old"},
+                {"src/lib.rs": stripped, "docs/guide.md": "new"},
+            )
+        )
+
+    def test_real_shippable_includes_resolve(self) -> None:
+        files: dict[str, str | None] = {}
+        for path in ROOT.rglob("*.rs"):
+            if "target" in path.parts:
+                continue
+            files[str(path.relative_to(ROOT))] = path.read_text(encoding="utf-8")
+        included = gate.shippable_includes(files)
+        self.assertIn("src-tauri/icons/128x128.png", included)
+        self.assertNotIn("crates/seam-core/src/link/fixtures/rcgen-0.13.2-cert.der", included)
+        self.assertFalse(gate.should_publish(files, dict(files)))
+
 
 class GitDecisionTests(unittest.TestCase):
     def test_tag_comparison_and_manual_dispatch(self) -> None:
@@ -341,15 +462,16 @@ class GitDecisionTests(unittest.TestCase):
             )
             self._git(tmp, ["add", "."])
             self._git(tmp, ["commit", "-m", "still only tests"])
-            self.assertEqual(gate.latest_release_tag(tmp), "v0.1.10")
-            self.assertFalse(gate.decide_git(cwd=tmp))
+            releases = {"v0.1.2", "v0.1.9", "v0.1.10"}
+            self.assertEqual(gate.latest_release_tag(tmp, releases=releases), "v0.1.10")
+            self.assertFalse(gate.decide_git(cwd=tmp, releases=releases))
             (lib / "lib.rs").write_text(
                 PROD.replace("fn shipped() -> i32 { 1 }", "fn shipped() -> i32 { 9 }"),
                 encoding="utf-8",
             )
             self._git(tmp, ["add", "."])
             self._git(tmp, ["commit", "-m", "real code"])
-            self.assertTrue(gate.decide_git(cwd=tmp))
+            self.assertTrue(gate.decide_git(cwd=tmp, releases=releases))
             env = os.environ.copy()
             env["GITHUB_EVENT_NAME"] = "workflow_dispatch"
             env.pop("GITHUB_OUTPUT", None)
@@ -374,9 +496,175 @@ class GitDecisionTests(unittest.TestCase):
             self._git(tmp, ["commit", "-m", "docs"])
             self.assertTrue(gate.decide_git(cwd=tmp))
 
+    def test_newest_merged_commit_beats_a_higher_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp)
+            lib = Path(tmp) / "src"
+            lib.mkdir()
+            (lib / "lib.rs").write_text("fn shipped() { 1 }\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "base"])
+            self._git(tmp, ["tag", "v9.9.9"])
+            (lib / "lib.rs").write_text("fn shipped() { 2 }\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "real"])
+            self._git(tmp, ["tag", "v0.1.1"])
+            releases = {"v9.9.9", "v0.1.1"}
+            # v9.9.9 is a higher version on an older commit. The tag on the
+            # newer commit is the baseline, so this HEAD does not publish.
+            self.assertEqual(gate.latest_release_tag(tmp, releases=releases), "v0.1.1")
+            self.assertFalse(gate.decide_git(cwd=tmp, releases=releases))
+
+    def test_unmerged_tag_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp)
+            (Path(tmp) / "README.md").write_text("docs\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "base"])
+            self._git(tmp, ["tag", "v0.1.1"])
+            branch = subprocess.check_output(
+                ["git", "branch", "--show-current"], cwd=tmp, text=True
+            ).strip()
+            self._git(tmp, ["checkout", "-b", "side"])
+            (Path(tmp) / "src").mkdir()
+            (Path(tmp) / "src" / "lib.rs").write_text("fn shipped() { 9 }\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "side"])
+            self._git(tmp, ["tag", "v8.0.0"])
+            self._git(tmp, ["checkout", branch])
+            (Path(tmp) / "README.md").write_text("docs changed\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "docs"])
+            releases = {"v0.1.1", "v8.0.0"}
+            self.assertEqual(gate.latest_release_tag(tmp, releases=releases), "v0.1.1")
+            self.assertFalse(gate.decide_git(cwd=tmp, releases=releases))
+
+    def test_missing_github_release_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp)
+            (Path(tmp) / "README.md").write_text("docs\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "base"])
+            self._git(tmp, ["tag", "v0.1.1"])
+            (Path(tmp) / "README.md").write_text("docs changed\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "docs"])
+            with self.assertRaises(gate.Uncertain):
+                gate.latest_release_tag(tmp, releases=set())
+            # Docs-only would skip if the tag counted. No release → publish.
+            self.assertTrue(gate.decide_git(cwd=tmp, releases=set()))
+            self.assertFalse(gate.decide_git(cwd=tmp, releases={"v0.1.1"}))
+            original = gate._github_release_tags
+
+            def boom(_cwd: str | None) -> set[str]:
+                raise gate.Uncertain("gh failed")
+
+            gate._github_release_tags = boom
+            try:
+                self.assertTrue(gate.decide_git(cwd=tmp))
+            finally:
+                gate._github_release_tags = original
+
+    def test_chmod_submodule_and_non_utf8_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp)
+            lib = Path(tmp) / "src"
+            lib.mkdir()
+            (lib / "lib.rs").write_text("fn shipped() { 1 }\n", encoding="utf-8")
+            (Path(tmp) / "README.md").write_text("docs\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "base"])
+            self._git(tmp, ["tag", "v0.1.1"])
+            releases = {"v0.1.1"}
+            self._git(tmp, ["update-index", "--chmod=+x", "README.md"])
+            self._git(tmp, ["commit", "-m", "chmod readme"])
+            self.assertFalse(gate.decide_git(cwd=tmp, releases=releases))
+            self._git(tmp, ["update-index", "--chmod=+x", "src/lib.rs"])
+            self._git(tmp, ["commit", "-m", "chmod source"])
+            self.assertTrue(gate.decide_git(cwd=tmp, releases=releases))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp)
+            (Path(tmp) / "README.md").write_text("docs\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "base"])
+            self._git(tmp, ["tag", "v0.1.1"])
+            sub = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=tmp).decode().strip()
+            payload = f"160000 {sub} 0\tvendor/lib\0".encode()
+            subprocess.run(
+                ["git", "update-index", "-z", "--index-info"],
+                cwd=tmp,
+                input=payload,
+                check=True,
+            )
+            self._git(tmp, ["commit", "-m", "submodule"])
+            self.assertTrue(gate.decide_git(cwd=tmp, releases={"v0.1.1"}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._init(tmp)
+            (Path(tmp) / "README.md").write_text("docs\n", encoding="utf-8")
+            self._git(tmp, ["add", "."])
+            self._git(tmp, ["commit", "-m", "base"])
+            self._git(tmp, ["tag", "v0.1.1"])
+            blob = subprocess.check_output(
+                ["git", "hash-object", "-w", "--stdin"], cwd=tmp, input=b"data"
+            ).decode().strip()
+            payload = f"100644 {blob} 0\t".encode() + b"weird/\xff.bin\0"
+            subprocess.run(
+                ["git", "update-index", "-z", "--index-info"],
+                cwd=tmp,
+                input=payload,
+                check=True,
+            )
+            self._git(tmp, ["commit", "-m", "odd name"])
+            self.assertTrue(gate.decide_git(cwd=tmp, releases={"v0.1.1"}))
+
+    def _init(self, tmp: str) -> None:
+        self._git(tmp, ["init", "-b", "main"])
+        self._git(tmp, ["config", "user.email", "gate@example.com"])
+        self._git(tmp, ["config", "user.name", "gate"])
+
     @staticmethod
     def _git(cwd: str, args: list[str]) -> None:
         subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+class ReleaseWorkflowTests(unittest.TestCase):
+    def test_gate_job_and_skip_notification(self) -> None:
+        text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        gate = _job(text, "gate")
+        build = _job(text, "build")
+        publish = _job(text, "publish")
+        self.assertIn("contents: read", gate)
+        self.assertNotIn("contents: write", gate)
+        self.assertIn("timeout-minutes: 5", gate)
+        self.assertIn("persist-credentials: false", gate)
+        self.assertEqual(text.count("persist-credentials:"), 1)
+        self.assertIn("needs: [plan, gate]", build)
+        self.assertIn("needs.gate.result != 'success'", build)
+        self.assertIn("needs.gate.outputs.publish != 'false'", build)
+        self.assertIn("needs.plan.result == 'success'", build)
+        self.assertIn("no release was made", text.split("jobs:", 1)[0])
+        self.assertIn("needs.gate.outputs.publish == 'true'", publish)
+        self.assertNotIn("needs.build.result", text)
+        self.assertNotIn("pull_request:", text)
+
+
+def _job(text: str, name: str) -> str:
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line == f"  {name}:":
+            start = index
+            break
+    if start is None:
+        raise AssertionError(f"job {name} not found")
+    block = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line.startswith("  ") and not line.startswith("   ") and line.endswith(":"):
+            break
+        block.append(line)
+    return "\n".join(block)
 
 
 if __name__ == "__main__":

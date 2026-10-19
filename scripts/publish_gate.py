@@ -5,17 +5,25 @@ The release version is ``0.1.<git rev-list --count HEAD>``. Skipping a publish
 does not create a tag and does not reuse that count: the next commit's count is
 strictly higher, so versions stay monotonic (gaps are expected).
 
-Comparison is against the latest ``v<major>.<minor>.<patch>`` tag. A change
-publishes when it can affect the shipped app. Tests (including ``#[cfg(test)]``
-modules and ``#[test]`` / ``#[tokio::test]`` functions inside ``src``), docs,
-workflows, fixtures, and README do not. Uncertainty publishes: a parse failure,
-a missing tag, or an unclassified edit never skips a release.
+Comparison is against the newest ``v<major>.<minor>.<patch>`` tag that is
+reachable from HEAD (``git tag --merged HEAD``) and that has a GitHub Release.
+Commit order wins over a higher version number on an older commit. No such tag,
+or a release list that cannot be read, publishes.
+
+A change publishes when it can affect the shipped app. Uncertainty publishes:
+a parse failure, an unreadable git object, a submodule, a non-UTF-8 path, a
+file-mode change of shippable content, or an include path that cannot be
+resolved. Skips are limited to known places (``.github/``, ``docs/``, top-level
+README and ``*.md``, ``crates/*/tests/``, ``crates/*/src/**/fixtures/``, and the
+gate harness). A file pulled into shippable code with ``include_str!`` or
+``include_bytes!`` is not skipped.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -25,6 +33,24 @@ from typing import Iterable
 
 class Uncertain(Exception):
     """The diff cannot be proved free of shippable changes."""
+
+
+class Unreadable:
+    """The path is in the tree, but its bytes cannot be shown to be unchanged."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def __repr__(self) -> str:
+        return f"Unreadable({self.reason})"
+
+
+class TreeEntry:
+    """One git tree entry: bytes plus the file mode (``100644``, ``100755``, ...)."""
+
+    def __init__(self, data: "str | bytes | None | Unreadable", mode: str | None) -> None:
+        self.data = data
+        self.mode = mode
 
 
 class Tok:
@@ -58,23 +84,40 @@ def norm_path(path: str) -> str:
 
 
 def is_non_shippable(path: str) -> bool:
-    """Paths that cannot change the shipped app by themselves."""
+    """Paths that cannot change the shipped app by themselves.
+
+    ``tests/``, ``fixtures/``, ``readme*`` and ``*.md`` are skipped only in
+    known places. The same path is shippable when production code includes it;
+    that override is applied by ``should_publish``.
+    """
     p = norm_path(path)
     parts = [part for part in p.split("/") if part]
     if not parts:
         return False
-    base = parts[-1].lower()
     if p == ".github" or p.startswith(".github/"):
         return True
     if p == "docs" or p.startswith("docs/"):
         return True
-    if "fixtures" in parts or "tests" in parts:
+    if p in _NON_SHIPPABLE_FILES:
         return True
-    if base == "readme" or base.startswith("readme."):
+    # Top-level README / README.* / *.md only. Nested copies can ship.
+    if len(parts) == 1:
+        base = parts[0].lower()
+        if base == "readme" or base.startswith("readme.") or base.endswith(".md"):
+            return True
+    # crates/<crate>/tests/** — integration tests, not the library crate root.
+    if len(parts) >= 3 and parts[0] == "crates" and parts[2] == "tests":
         return True
-    if base.endswith(".md"):
+    # crates/<crate>/src/**/fixtures/** — unit-test fixtures. An include from
+    # shippable Rust overrides this in should_publish.
+    if (
+        len(parts) >= 4
+        and parts[0] == "crates"
+        and parts[2] == "src"
+        and "fixtures" in parts[3:]
+    ):
         return True
-    return p in _NON_SHIPPABLE_FILES
+    return False
 
 
 def is_cargo_toml(path: str) -> bool:
@@ -111,20 +154,60 @@ def should_publish(
         return True
 
 
+def _split_entries(
+    files: dict[str, str | bytes | None | TreeEntry | Unreadable],
+) -> tuple[dict[str, str | bytes | None], dict[str, str | None]]:
+    """Separate bytes from modes. An unreadable entry is uncertain immediately.
+
+    Two failed reads used to compare equal (both ``None``) and were skipped.
+    A path that is present but cannot be read must publish instead.
+    """
+    data: dict[str, str | bytes | None] = {}
+    modes: dict[str, str | None] = {}
+    for path, value in files.items():
+        if isinstance(value, Unreadable):
+            raise Uncertain(f"unreadable {path}: {value.reason}")
+        if isinstance(value, TreeEntry):
+            if isinstance(value.data, Unreadable):
+                raise Uncertain(f"unreadable {path}: {value.data.reason}")
+            data[path] = value.data
+            modes[path] = value.mode
+        else:
+            data[path] = value
+            modes[path] = None
+    return data, modes
+
+
 def _should_publish(
-    before: dict[str, str | bytes | None],
-    after: dict[str, str | bytes | None],
+    before: dict[str, str | bytes | None | TreeEntry | Unreadable],
+    after: dict[str, str | bytes | None | TreeEntry | Unreadable],
 ) -> bool:
+    before_data, before_mode = _split_entries(before)
+    after_data, after_mode = _split_entries(after)
+    # Includes are collected from every Rust file we were given, not only the
+    # paths that changed, so an unchanged include site still protects the file.
+    forced = shippable_includes(before_data) | shippable_includes(after_data)
     saw_cargo = False
-    for path in set(before) | set(after):
+    for path in set(before_data) | set(after_data):
         if is_cargo_path(path):
             saw_cargo = True
             continue
-        old = before.get(path)
-        new = after.get(path)
+        old = before_data.get(path)
+        new = after_data.get(path)
+        old_mode = before_mode.get(path)
+        new_mode = after_mode.get(path)
+        ships = path in forced or not is_non_shippable(path)
+        # chmod of something that ships is a publish, even when the bytes match.
+        if (
+            ships
+            and old_mode is not None
+            and new_mode is not None
+            and old_mode != new_mode
+        ):
+            return True
         if old == new:
             continue
-        if is_non_shippable(path):
+        if not ships:
             continue
         if is_rust_path(path) and not isinstance(old, (bytes, bytearray)) and not isinstance(
             new, (bytes, bytearray)
@@ -133,9 +216,156 @@ def _should_publish(
                 return True
             continue
         return True
-    if saw_cargo and cargo_fingerprint(before) != cargo_fingerprint(after):
+    if saw_cargo and cargo_fingerprint(before_data) != cargo_fingerprint(after_data):
         return True
     return False
+
+
+_INCLUDE_MACROS = {"include_str", "include_bytes"}
+
+
+def shippable_includes(files: dict[str, str | bytes | None]) -> set[str]:
+    """Paths named by ``include_str!`` / ``include_bytes!`` in shippable Rust.
+
+    An include that is not a single string literal cannot be proved test-only,
+    so it publishes. Includes inside ``#[cfg(test)]`` are already stripped.
+    """
+    found: set[str] = set()
+    for path, content in files.items():
+        # A Rust file in a known test/fixture location is not part of the
+        # shipped crate, so its includes (and a parse failure there) do not
+        # publish. Unknown locations still fail open.
+        if not is_rust_path(path) or content is None or is_non_shippable(path):
+            continue
+        if isinstance(content, (bytes, bytearray)):
+            raise Uncertain(f"non-text rust {path}")
+        if not isinstance(content, str):
+            raise Uncertain(f"unexpected rust content for {path}")
+        found.update(_includes_in(path, content))
+    return found
+
+
+def _includes_in(path: str, content: str) -> set[str]:
+    tokens = lex(shippable_rust(content))
+    found: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token.kind != "ident" or token.text not in _INCLUDE_MACROS:
+            index += 1
+            continue
+        span = _macro_args(tokens, index)
+        if span is None:
+            index += 1
+            continue
+        args, index = span
+        if len(args) != 1 or args[0].kind != "string":
+            raise Uncertain(f"unresolved {token.text}! in {path}")
+        found.add(_resolve_include(path, _decode_include_literal(args[0].text)))
+    return found
+
+
+def _macro_args(tokens: list[Tok], index: int) -> tuple[list[Tok], int] | None:
+    if (
+        index + 2 >= len(tokens)
+        or tokens[index + 1].text != "!"
+        or tokens[index + 2].text != "("
+    ):
+        return None
+    depth = 0
+    cursor = index + 2
+    start = index + 3
+    while cursor < len(tokens):
+        text = tokens[cursor].text
+        if text in _OPEN:
+            depth += 1
+        elif text in _CLOSE:
+            depth -= 1
+            if depth == 0:
+                return tokens[start:cursor], cursor + 1
+        cursor += 1
+    raise Uncertain("unclosed include macro")
+
+
+def _decode_include_literal(text: str) -> str:
+    body = text
+    if body.startswith(("br", "cr")):
+        return _raw_string_body(body[2:])
+    if body.startswith("r"):
+        return _raw_string_body(body[1:])
+    if body.startswith(("b", "c")):
+        body = body[1:]
+    if len(body) < 2 or not body.startswith('"') or not body.endswith('"'):
+        raise Uncertain(f"bad include literal {text!r}")
+    return _unescape_string(body[1:-1])
+
+
+def _raw_string_body(body: str) -> str:
+    hashes = 0
+    while hashes < len(body) and body[hashes] == "#":
+        hashes += 1
+    opener = ("#" * hashes) + '"'
+    closer = '"' + ("#" * hashes)
+    if (
+        len(body) < len(opener) + len(closer)
+        or not body.startswith(opener)
+        or not body.endswith(closer)
+    ):
+        raise Uncertain(f"bad raw include literal {body!r}")
+    return body[len(opener) : len(body) - len(closer)]
+
+
+def _unescape_string(body: str) -> str:
+    out: list[str] = []
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= len(body):
+            raise Uncertain("truncated escape in include path")
+        nxt = body[index + 1]
+        simple = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"', "'": "'", "0": "\0"}
+        if nxt in simple:
+            out.append(simple[nxt])
+            index += 2
+            continue
+        if nxt == "\n":
+            index += 2
+            continue
+        if nxt == "u" and index + 2 < len(body) and body[index + 2] == "{":
+            end = body.find("}", index + 3)
+            if end < 0:
+                raise Uncertain("unclosed unicode escape in include path")
+            try:
+                out.append(chr(int(body[index + 3 : end], 16)))
+            except ValueError as exc:
+                raise Uncertain("bad unicode escape in include path") from exc
+            index = end + 1
+            continue
+        if nxt == "x" and index + 3 < len(body):
+            try:
+                out.append(chr(int(body[index + 2 : index + 4], 16)))
+            except ValueError as exc:
+                raise Uncertain("bad hex escape in include path") from exc
+            index += 4
+            continue
+        raise Uncertain(f"bad escape in include path: \\{nxt}")
+    return "".join(out)
+
+
+def _resolve_include(rs_path: str, literal: str) -> str:
+    if not literal or "\n" in literal or "\r" in literal or "\x00" in literal:
+        raise Uncertain(f"bad include path {literal!r} from {rs_path}")
+    if literal.startswith("/") or (len(literal) > 2 and literal[1] == ":"):
+        raise Uncertain(f"absolute include {literal!r} from {rs_path}")
+    base = posixpath.dirname(norm_path(rs_path))
+    joined = posixpath.normpath(posixpath.join(base, literal.replace("\\", "/")))
+    if joined == ".." or joined.startswith("../") or joined.startswith("/"):
+        raise Uncertain(f"include escapes the repo: {literal!r} from {rs_path}")
+    return joined
 
 
 def shippable_rust(src: str | None) -> str:
@@ -1119,58 +1349,180 @@ def _tilde_upper(nums: tuple[int, ...]) -> tuple[int, ...]:
     return (nums[0], nums[1] + 1, 0)
 
 
-def decide_git(head: str = "HEAD", cwd: str | None = None) -> bool:
-    """Compare ``head`` with the latest release tag. No tag publishes."""
-    tag = latest_release_tag(cwd)
-    if tag is None:
+def decide_git(
+    head: str = "HEAD",
+    cwd: str | None = None,
+    releases: Iterable[str] | None = None,
+) -> bool:
+    """Compare ``head`` with the newest merged release tag. No tag publishes.
+
+    ``releases`` is the set of tags that have a GitHub Release. ``None`` asks
+    GitHub. A lookup failure publishes (fail-open).
+    """
+    try:
+        tag = latest_release_tag(cwd, head=head, releases=releases)
+        if tag is None:
+            return True
+        if _git(["rev-parse", "--verify", "--quiet", tag + "^{commit}"], cwd).returncode != 0:
+            raise Uncertain(f"tag {tag} does not resolve")
+        paths = set(changed_paths(tag, head, cwd))
+        paths.update(_tree_paths(tag, cwd, is_cargo_path))
+        paths.update(_tree_paths(head, cwd, is_cargo_path))
+        # Every Rust file, changed or not, so include_str!/include_bytes! in
+        # shippable code is visible when only the included file changed.
+        paths.update(_tree_paths(tag, cwd, is_rust_path))
+        paths.update(_tree_paths(head, cwd, is_rust_path))
+        before = {path: _read_blob(tag, path, cwd) for path in paths}
+        after = {path: _read_blob(head, path, cwd) for path in paths}
+        return should_publish(before, after)
+    except Uncertain as exc:
+        print(f"publish gate uncertain ({exc}); publishing", file=sys.stderr)
         return True
-    if _git(["rev-parse", "--verify", "--quiet", tag + "^{commit}"], cwd).returncode != 0:
-        raise Uncertain(f"tag {tag} does not resolve")
-    paths = set(changed_paths(tag, head, cwd))
-    paths.update(_cargo_paths(tag, cwd))
-    paths.update(_cargo_paths(head, cwd))
-    before = {path: _read_blob(tag, path, cwd) for path in paths}
-    after = {path: _read_blob(head, path, cwd) for path in paths}
-    return should_publish(before, after)
 
 
-def latest_release_tag(cwd: str | None = None) -> str | None:
-    result = _git(["tag", "-l", "v*", "--sort=-v:refname"], cwd)
+def latest_release_tag(
+    cwd: str | None = None,
+    *,
+    head: str = "HEAD",
+    releases: Iterable[str] | None = None,
+) -> str | None:
+    """Newest reachable ``vX.Y.Z`` tag that also has a GitHub Release.
+
+    Reachable means ``git tag --merged <head>``. Among those, the tag whose
+    commit is closest to ``head`` wins; a higher version breaks a tie on the
+    same commit. Tags that are not merged, or that have no GitHub Release, are
+    ignored. If merged tags exist but none (or an unknown set) have a release,
+    raise ``Uncertain`` so the caller publishes.
+    """
+    result = _git(["tag", "--merged", head, "-l", "v*"], cwd)
     if result.returncode != 0:
         raise Uncertain(result.stderr.decode("utf-8", "replace").strip() or "git tag failed")
-    for line in result.stdout.decode("utf-8", "replace").splitlines():
-        tag = line.strip()
+    merged: list[str] = []
+    for line in result.stdout.splitlines():
+        try:
+            tag = _decode_path(line).strip()
+        except Uncertain:
+            raise
         if _RELEASE_TAG.fullmatch(tag):
-            return tag
-    return None
+            merged.append(tag)
+    if not merged:
+        return None
+    if releases is None:
+        known = _github_release_tags(cwd)
+    else:
+        known = set(releases)
+    candidates = [tag for tag in merged if tag in known]
+    if not candidates:
+        raise Uncertain("no merged v* tag has a GitHub Release")
+
+    def rank(tag: str) -> tuple[int, tuple[int, ...]]:
+        distance = _git(["rev-list", "--count", f"{tag}..{head}"], cwd)
+        if distance.returncode != 0:
+            raise Uncertain(
+                distance.stderr.decode("utf-8", "replace").strip() or f"cannot rank {tag}"
+            )
+        try:
+            commits = int(distance.stdout.decode("utf-8").strip() or "0")
+        except ValueError as exc:
+            raise Uncertain(f"cannot rank {tag}") from exc
+        version = tuple(-int(part) for part in tag[1:].split("."))
+        return commits, version
+
+    return min(candidates, key=rank)
+
+
+def _github_release_tags(cwd: str | None) -> set[str]:
+    env = os.environ.copy()
+    token = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")
+    if token:
+        env["GH_TOKEN"] = token
+    proc = subprocess.run(
+        ["gh", "release", "list", "--limit", "500", "--json", "tagName"],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise Uncertain(detail or "gh release list failed")
+    try:
+        rows = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Uncertain(f"gh release list: {exc}") from exc
+    if not isinstance(rows, list):
+        raise Uncertain("gh release list did not return a list")
+    if len(rows) >= 500:
+        raise Uncertain("gh release list truncated")
+    tags: set[str] = set()
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("tagName"), str):
+            tags.add(row["tagName"])
+    return tags
 
 
 def changed_paths(old: str, new: str, cwd: str | None = None) -> list[str]:
     result = _git(["diff", "--name-only", "--no-renames", "-z", old, new], cwd)
     if result.returncode != 0:
         raise Uncertain(result.stderr.decode("utf-8", "replace").strip() or "git diff failed")
-    return [name.decode("utf-8", "replace") for name in result.stdout.split(b"\0") if name]
+    return [_decode_path(name) for name in result.stdout.split(b"\0") if name]
 
 
-def _cargo_paths(rev: str, cwd: str | None) -> list[str]:
+def _tree_paths(rev: str, cwd: str | None, predicate) -> list[str]:
     result = _git(["ls-tree", "-r", "--name-only", "-z", rev], cwd)
     if result.returncode != 0:
         raise Uncertain(result.stderr.decode("utf-8", "replace").strip() or "git ls-tree failed")
-    names = [name.decode("utf-8", "replace") for name in result.stdout.split(b"\0") if name]
-    return [name for name in names if is_cargo_path(name)]
+    names = [_decode_path(name) for name in result.stdout.split(b"\0") if name]
+    return [name for name in names if predicate(name)]
 
 
-def _read_blob(rev: str, path: str, cwd: str | None) -> str | bytes | None:
-    result = _git(["cat-file", "blob", f"{rev}:{path}"], cwd)
+def _decode_path(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Uncertain("non-utf8 path") from exc
+
+
+def _read_blob(rev: str, path: str, cwd: str | None) -> TreeEntry:
+    """Read one path. Absent is ``None``; present-but-unreadable publishes.
+
+    A submodule (mode ``160000`` / gitlink) cannot be diffed as a blob, so it
+    is unreadable. ``cat-file`` failure on a blob that ``ls-tree`` listed is
+    the same: the bytes are not available to compare.
+    """
+    listed = _git(["ls-tree", "-z", rev, "--", path], cwd)
+    if listed.returncode != 0:
+        raise Uncertain(listed.stderr.decode("utf-8", "replace").strip() or f"ls-tree {path}")
+    raw = listed.stdout
+    if not raw:
+        return TreeEntry(None, None)
+    record = raw.split(b"\0", 1)[0]
+    meta, sep, name = record.partition(b"\t")
+    if sep != b"\t":
+        raise Uncertain(f"bad ls-tree record for {path}")
+    _decode_path(name)
+    parts = meta.split(b" ")
+    if len(parts) < 3:
+        raise Uncertain(f"bad ls-tree record for {path}")
+    try:
+        mode = parts[0].decode("ascii")
+        kind = parts[1].decode("ascii")
+        sha = parts[2].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise Uncertain(f"bad ls-tree record for {path}") from exc
+    if kind == "commit" or mode == "160000":
+        return TreeEntry(Unreadable(f"submodule {path}"), mode)
+    if kind != "blob":
+        return TreeEntry(Unreadable(f"{kind} {path}"), mode)
+    result = _git(["cat-file", "blob", sha], cwd)
     if result.returncode != 0:
-        return None
+        return TreeEntry(Unreadable(f"unreadable {path}"), mode)
     data = result.stdout
     if b"\0" in data:
-        return data
+        return TreeEntry(data, mode)
     try:
-        return data.decode("utf-8")
+        return TreeEntry(data.decode("utf-8"), mode)
     except UnicodeDecodeError:
-        return data
+        return TreeEntry(data, mode)
 
 
 def _git(args: list[str], cwd: str | None) -> subprocess.CompletedProcess[bytes]:

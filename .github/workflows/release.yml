@@ -1,8 +1,8 @@
 name: Release
 # Builds Linux, Mac and Windows on every push to main. Publishes a release when
-# shippable app code changed since the latest v* tag. With the
-# TAURI_SIGNING_PRIVATE_KEY secret set, the release also carries signed update
-# files and latest.json, so installed apps update themselves.
+# shippable app code changed since the newest merged v* tag that has a GitHub
+# Release. With the TAURI_SIGNING_PRIVATE_KEY secret set, the release also
+# carries signed update files and latest.json, so installed apps update themselves.
 on:
   push:
     branches: [main]
@@ -12,8 +12,11 @@ on:
     paths-ignore: ['.github/**', '**.md']
   workflow_call:
     outputs:
+      # agent.yml posts this string after "released: ". A skipped publish has
+      # no url; say so instead of leaving the link empty. `&&` yields the url
+      # when the job succeeded, otherwise the fallback.
       url:
-        value: ${{ jobs.publish.outputs.url }}
+        value: ${{ jobs.publish.result == 'success' && jobs.publish.outputs.url || 'no release was made' }}
   workflow_dispatch:
 permissions:
   contents: write
@@ -39,7 +42,12 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: plan
+    needs: [plan, gate]
+    # Skip the matrix only when the gate is sure nothing ships. A failed or
+    # cancelled plan does not build. A failed gate, a missing output, or a
+    # manual dispatch still builds (fail-open). One red platform does not
+    # block the others or the publish job.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.gate.result != 'success' || needs.gate.outputs.publish != 'false') }}
     strategy:
       fail-fast: false
       matrix:
@@ -136,6 +144,9 @@ jobs:
   gate:
     needs: plan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
     outputs:
       publish: ${{ steps.gate.outputs.publish }}
     steps:
@@ -144,6 +155,7 @@ jobs:
           ref: ${{ needs.plan.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
       - name: Fetch release tags
         run: git fetch origin --tags --force || echo "::warning title=Tag fetch failed::using tags already present"
       - name: Decide whether this commit ships app code
