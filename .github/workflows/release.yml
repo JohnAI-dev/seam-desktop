@@ -1,11 +1,15 @@
 name: Release
-# Builds Linux, Mac and Windows on every change to main and publishes a release.
-# With the TAURI_SIGNING_PRIVATE_KEY secret set, the release also carries signed update
+# Builds Linux, Mac and Windows on every push to main. Publishes a release when
+# shippable app code changed since the latest v* tag. With the
+# TAURI_SIGNING_PRIVATE_KEY secret set, the release also carries signed update
 # files and latest.json, so installed apps update themselves.
 on:
   push:
     branches: [main]
-    paths-ignore: ['.github/**', '**.md', 'Cargo.lock']
+    # Cargo.lock is not ignored: a lockfile-only update can change the app.
+    # The publish gate separates runtime dependencies from dev-dependencies.
+    # Docs and workflow-only pushes still skip this workflow entirely.
+    paths-ignore: ['.github/**', '**.md']
   workflow_call:
     outputs:
       url:
@@ -28,7 +32,8 @@ jobs:
           ref: main
           fetch-depth: 0
       - id: v
-        # Version = 0.1.<number of commits>, so every release is newer than the last.
+        # Version = 0.1.<commit count>. A skipped publish does not create a tag,
+        # so the next publish's count is strictly higher. Gaps are expected.
         run: |
           echo "version=0.1.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -128,10 +133,40 @@ jobs:
             target/release/bundle/nsis/*.exe.sig
           if-no-files-found: error
 
+  gate:
+    needs: plan
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Fetch release tags
+        run: git fetch origin --tags --force || echo "::warning title=Tag fetch failed::using tags already present"
+      - name: Decide whether this commit ships app code
+        id: gate
+        run: |
+          set +e
+          python3 scripts/publish_gate.py
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            echo "::warning title=Publish gate failed open::publish_gate.py exited $code"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif ! grep -qx 'publish=true' "$GITHUB_OUTPUT" && ! grep -qx 'publish=false' "$GITHUB_OUTPUT"; then
+            echo "::warning title=Publish gate failed open::no publish output"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
   publish:
-    needs: [plan, build]
+    needs: [plan, build, gate]
     # Publish whatever platforms built, even if one of them failed.
-    if: ${{ !cancelled() }}
+    # Skip only when the gate is sure nothing shippable changed. A failed gate
+    # or a manual workflow_dispatch still publishes.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.gate.result != 'success' || needs.gate.outputs.publish == 'true') }}
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.rel.outputs.url }}
