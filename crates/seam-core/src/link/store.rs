@@ -158,8 +158,8 @@ mod tests {
         assert!(Store::open(&dir).unwrap().devices().is_empty());
     }
 
-    /// A desktop that already has `cert.der` and `key.der` must keep that identity.
-    /// Generating a new one would break every phone paired to the old certificate.
+    /// Bytes already stored in `cert.der` and `key.der` are returned unchanged.
+    /// The bytes in this test are not a certificate or a key, and rustls is not called.
     #[test]
     fn existing_identity_files_load_unchanged() {
         let dir = temp_dir("existing");
@@ -193,5 +193,39 @@ mod tests {
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der)),
             )
             .expect("generated identity is a PKCS#8 key rustls accepts");
+    }
+
+    /// Certificate and PKCS#8 key produced by rcgen 0.13.2
+    /// `generate_simple_self_signed(["seam.local"])`, the crate that wrote
+    /// desktop identities before 0.14. The fingerprint is SHA-256 of `cert.der`.
+    #[test]
+    fn rcgen_013_identity_keeps_its_fingerprint_and_loads_into_rustls() {
+        use std::sync::Arc;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        use tokio_rustls::rustls::{self, ServerConfig};
+
+        let cert = include_bytes!("fixtures/rcgen-0.13.2-cert.der");
+        let key = include_bytes!("fixtures/rcgen-0.13.2-key.der");
+        let dir = temp_dir("rcgen013");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cert.der"), cert).unwrap();
+        fs::write(dir.join("key.der"), key).unwrap();
+        let loaded = Store::open(&dir).unwrap().identity().unwrap();
+        assert_eq!(loaded.cert_der, cert);
+        assert_eq!(loaded.key_der, key);
+        assert_eq!(
+            crate::link::protocol::fingerprint(&loaded.cert_der),
+            "bdf822ea93b53222b186e1fa1a74692fd70e6d9924e784e6f379232ab66c4247"
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(loaded.cert_der)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(loaded.key_der)),
+            )
+            .expect("rcgen 0.13 identity loads into rustls");
     }
 }
