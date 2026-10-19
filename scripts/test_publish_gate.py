@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -423,6 +424,35 @@ mod tests {
             )
         )
 
+    def test_include_macro_and_rust_fixtures(self) -> None:
+        parent = 'include!("../docs/snippet.rs");\n'
+        self.assertEqual(
+            gate.shippable_includes({"src/lib.rs": parent}),
+            {"docs/snippet.rs"},
+        )
+        before = {"src/lib.rs": parent, "docs/snippet.rs": "fn other() { 1 }\n"}
+        after = {"src/lib.rs": parent, "docs/snippet.rs": "fn other() { 2 }\n"}
+        self.assertTrue(gate.should_publish(before, after))
+        unresolved = 'include!(concat!("fixtures/helper.rs"));\n'
+        self.assertTrue(
+            gate.should_publish({"src/lib.rs": unresolved}, {"src/lib.rs": unresolved})
+        )
+        fixture = '''
+fn shipped() { 1 }
+#[cfg(test)]
+mod tests { fn scratch() { let _ = "helper"; } }
+'''
+        path = "crates/app/src/fixtures/helper.rs"
+        self.assertFalse(
+            gate.should_publish({path: fixture}, {path: fixture.replace("helper", "changed")})
+        )
+        self.assertTrue(
+            gate.should_publish(
+                {path: fixture},
+                {path: fixture.replace("fn shipped() { 1 }", "fn shipped() { 2 }")},
+            )
+        )
+
     def test_real_shippable_includes_resolve(self) -> None:
         files: dict[str, str | None] = {}
         for path in ROOT.rglob("*.rs"):
@@ -645,9 +675,86 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("needs.gate.outputs.publish != 'false'", build)
         self.assertIn("needs.plan.result == 'success'", build)
         self.assertIn("no release was made", text.split("jobs:", 1)[0])
-        self.assertIn("needs.gate.outputs.publish == 'true'", publish)
+        self.assertIn("needs.gate.outputs.publish != 'false'", publish)
+        self.assertNotIn("needs.gate.outputs.publish == 'true'", publish)
         self.assertNotIn("needs.build.result", text)
         self.assertNotIn("pull_request:", text)
+        decide = _step(gate, "Decide whether this commit ships app code")
+        self.assertIn("GH_TOKEN: ${{ github.token }}", decide)
+        self.assertIn("\n        env:\n", "\n" + decide + "\n")
+        self.assertNotIn("GH_TOKEN", _step(gate, "Fetch release tags"))
+
+
+class ReleaseListTests(unittest.TestCase):
+    def test_release_list_excludes_drafts(self) -> None:
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(args, **_kwargs):
+            captured["args"] = list(args)
+
+            class Proc:
+                returncode = 0
+                stdout = b"[]"
+                stderr = b""
+
+            return Proc()
+
+        original = gate.subprocess.run
+        gate.subprocess.run = fake_run
+        try:
+            self.assertEqual(gate._github_release_tags(None), set())
+        finally:
+            gate.subprocess.run = original
+        self.assertEqual(
+            captured["args"],
+            [
+                "gh",
+                "release",
+                "list",
+                "--exclude-drafts",
+                "--limit",
+                "500",
+                "--json",
+                "tagName",
+            ],
+        )
+
+    def test_release_list_at_the_page_limit_is_uncertain(self) -> None:
+        payload = json.dumps([{"tagName": f"v0.0.{i}"} for i in range(500)]).encode()
+
+        def fake_run(_args, **_kwargs):
+            class Proc:
+                returncode = 0
+                stdout = payload
+                stderr = b""
+
+            return Proc()
+
+        original = gate.subprocess.run
+        gate.subprocess.run = fake_run
+        try:
+            with self.assertRaises(gate.Uncertain) as raised:
+                gate._github_release_tags(None)
+        finally:
+            gate.subprocess.run = original
+        self.assertIn("truncated", str(raised.exception))
+
+
+def _step(job: str, name: str) -> str:
+    lines = job.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == f"- name: {name}":
+            start = index
+            break
+    if start is None:
+        raise AssertionError(f"step {name} not found")
+    block = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line.startswith("      - "):
+            break
+        block.append(line)
+    return "\n".join(block)
 
 
 def _job(text: str, name: str) -> str:

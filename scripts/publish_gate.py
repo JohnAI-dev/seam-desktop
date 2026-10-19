@@ -15,7 +15,8 @@ a parse failure, an unreadable git object, a submodule, a non-UTF-8 path, a
 file-mode change of shippable content, or an include path that cannot be
 resolved. Skips are limited to known places (``.github/``, ``docs/``, top-level
 README and ``*.md``, ``crates/*/tests/``, ``crates/*/src/**/fixtures/``, and the
-gate harness). A file pulled into shippable code with ``include_str!`` or
+gate harness). Rust sources under ``fixtures/`` are not skipped. A file
+pulled into shippable code with ``include!``, ``include_str!``, or
 ``include_bytes!`` is not skipped.
 """
 
@@ -108,13 +109,14 @@ def is_non_shippable(path: str) -> bool:
     # crates/<crate>/tests/** — integration tests, not the library crate root.
     if len(parts) >= 3 and parts[0] == "crates" and parts[2] == "tests":
         return True
-    # crates/<crate>/src/**/fixtures/** — unit-test fixtures. An include from
-    # shippable Rust overrides this in should_publish.
+    # crates/<crate>/src/**/fixtures/** — unit-test data. .rs files are not
+    # skipped: they can be compiled via include! or a module.
     if (
         len(parts) >= 4
         and parts[0] == "crates"
         and parts[2] == "src"
         and "fixtures" in parts[3:]
+        and not p.endswith(".rs")
     ):
         return True
     return False
@@ -221,11 +223,11 @@ def _should_publish(
     return False
 
 
-_INCLUDE_MACROS = {"include_str", "include_bytes"}
+_INCLUDE_MACROS = {"include", "include_str", "include_bytes"}
 
 
 def shippable_includes(files: dict[str, str | bytes | None]) -> set[str]:
-    """Paths named by ``include_str!`` / ``include_bytes!`` in shippable Rust.
+    """Paths named by ``include!`` / ``include_str!`` / ``include_bytes!`` in shippable Rust.
 
     An include that is not a single string literal cannot be proved test-only,
     so it publishes. Includes inside ``#[cfg(test)]`` are already stripped.
@@ -1432,12 +1434,26 @@ def latest_release_tag(
 
 
 def _github_release_tags(cwd: str | None) -> set[str]:
+    """Published (non-draft) release tags.
+
+    The gate step must pass ``GH_TOKEN`` (``github.token``). Without it,
+    ``gh`` exits 4 and this raises ``Uncertain``, which publishes.
+    """
     env = os.environ.copy()
     token = env.get("GH_TOKEN") or env.get("GITHUB_TOKEN")
     if token:
         env["GH_TOKEN"] = token
     proc = subprocess.run(
-        ["gh", "release", "list", "--limit", "500", "--json", "tagName"],
+        [
+            "gh",
+            "release",
+            "list",
+            "--exclude-drafts",
+            "--limit",
+            "500",
+            "--json",
+            "tagName",
+        ],
         cwd=cwd,
         env=env,
         capture_output=True,
@@ -1451,6 +1467,8 @@ def _github_release_tags(cwd: str | None) -> set[str]:
         raise Uncertain(f"gh release list: {exc}") from exc
     if not isinstance(rows, list):
         raise Uncertain("gh release list did not return a list")
+    # gh returns at most --limit rows. 500 or more means the page may have
+    # omitted the real baseline tag, so fail open and publish.
     if len(rows) >= 500:
         raise Uncertain("gh release list truncated")
     tags: set[str] = set()

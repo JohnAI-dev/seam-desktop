@@ -160,6 +160,8 @@ jobs:
         run: git fetch origin --tags --force || echo "::warning title=Tag fetch failed::using tags already present"
       - name: Decide whether this commit ships app code
         id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           python3 scripts/publish_gate.py
@@ -176,9 +178,10 @@ jobs:
   publish:
     needs: [plan, build, gate]
     # Publish whatever platforms built, even if one of them failed.
-    # Skip only when the gate is sure nothing shippable changed. A failed gate
-    # or a manual workflow_dispatch still publishes.
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.gate.result != 'success' || needs.gate.outputs.publish == 'true') }}
+    # Skip only when the gate is sure nothing shippable changed. A failed gate,
+    # a missing or unexpected output, or a manual workflow_dispatch still
+    # publishes. `!= 'false'` matches the build job so an empty output fails open.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.gate.result != 'success' || needs.gate.outputs.publish != 'false') }}
     runs-on: ubuntu-latest
     outputs:
       url: ${{ steps.rel.outputs.url }}
