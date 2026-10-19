@@ -9,6 +9,9 @@ CURRENT="setup"
 step() { CURRENT="$*"; echo; echo "== $*"; }
 trap 'echo "::error title=Test failed::Step \"$CURRENT\" failed"' ERR
 
+step "publish gate"
+python3 scripts/test_publish_gate.py
+
 step "fetch built-in tools"
 python3 scripts/fetch_tools.py linux-x86_64
 
