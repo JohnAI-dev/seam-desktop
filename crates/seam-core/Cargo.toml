@@ -28,7 +28,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = "0.14"
 hmac = "0.13"
 sha2 = "0.11"
-rand = "0.9"
+rand = "0.10"
 base64 = "0.23"
 hex = "0.4"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
